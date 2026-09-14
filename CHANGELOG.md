@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.17](https://github.com/sympozium-ai/celln/compare/v0.5.16...v0.5.17) (2026-09-14)
+
+
+### Bug Fixes
+
+* **parent:** a failed child is a failed turn, not lost parent context ([5ebbcfb](https://github.com/sympozium-ai/celln/commit/5ebbcfb8291dba0a4760fafa54912c73e44d6966))
+* **parent:** a failed child is a failed turn, not lost parent context ([6d04a99](https://github.com/sympozium-ai/celln/commit/6d04a9945e51c0c97c8f4b171799d17689365759)), closes [#124](https://github.com/sympozium-ai/celln/issues/124)
+
 ## [0.5.16](https://github.com/sympozium-ai/celln/compare/v0.5.15...v0.5.16) (2026-09-14)
 
 
