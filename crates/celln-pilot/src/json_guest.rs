@@ -51,7 +51,10 @@ pub fn run(
                 &["--json-stdin".into()],
                 wire,
                 1_048_576,
-                std::time::Duration::from_secs(45),
+                // The host broker bounds each model request by the cell's
+                // lifetime and the host ends the cell at that deadline; the
+                // guest only waits for the broker's answer.
+                MODEL_REPLY_WAIT,
             )
         },
         |tool, input| {
@@ -67,3 +70,7 @@ pub fn run(
     )?;
     Ok(())
 }
+
+/// Longest the guest waits for one brokered model reply. Not a policy limit:
+/// the host deadline for the cell is shorter and is what actually applies.
+const MODEL_REPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
