@@ -216,6 +216,39 @@ mod tests {
         );
         assert!(!root.join("trusted-parent-permits").exists());
         assert!(crate::starter_configure::run(&config_plan, &root).is_err());
+        // Reviewed defaults are published as the host ceilings.
+        let receipt: Value =
+            serde_json::from_slice(&fs::read(configured.join("configured.json")).unwrap()).unwrap();
+        assert_eq!(receipt["hostLimits"]["leaseSeconds"], 3600);
+        assert_eq!(receipt["hostLimits"]["maxTurns"], 12);
+        // Operator host limits reach the parent lifetime, the native
+        // template totals and the receipt; out-of-range values are refused
+        // before anything is written.
+        let long_lived = dir.path().join("configured-long");
+        let long_plan = dir.path().join("config-plan-long.json");
+        let mut plan: Value = serde_json::from_slice(&fs::read(&config_plan).unwrap()).unwrap();
+        plan["output"] = json!(long_lived);
+        plan["hostLimits"] = json!({"leaseSeconds": 86400, "maxTurns": 256, "maxModelRequests": 768, "maxOutputTokens": 393216});
+        fs::write(&long_plan, serde_json::to_vec(&plan).unwrap()).unwrap();
+        assert_eq!(crate::starter_configure::run(&long_plan, &root).unwrap(), 0);
+        let native: Value =
+            serde_json::from_slice(&fs::read(long_lived.join("native-template.json")).unwrap())
+                .unwrap();
+        assert_eq!(native["parent"]["capabilities"]["timeoutMs"], 86_400_000);
+        assert_eq!(native["maxTurns"], 256);
+        assert_eq!(native["totalModelRequests"], 768);
+        assert_eq!(native["totalOutputTokens"], 393216);
+        assert_eq!(native["turnOutputTokens"], 1536);
+        let receipt: Value =
+            serde_json::from_slice(&fs::read(long_lived.join("configured.json")).unwrap()).unwrap();
+        assert_eq!(receipt["hostLimits"]["leaseSeconds"], 86400);
+        let bad = dir.path().join("configured-bad");
+        let bad_plan = dir.path().join("config-plan-bad.json");
+        plan["output"] = json!(bad);
+        plan["hostLimits"] = json!({"leaseSeconds": 86401});
+        fs::write(&bad_plan, serde_json::to_vec(&plan).unwrap()).unwrap();
+        assert!(crate::starter_configure::run(&bad_plan, &root).is_err());
+        assert!(!bad.exists());
         for name in [
             "parent-issuance",
             "trusted-parent-permits",
