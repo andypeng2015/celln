@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.11](https://github.com/sympozium-ai/celln/compare/v0.5.10...v0.5.11) (2026-09-14)
+
+
+### Features
+
+* **parents:** provision on the owning dispatcher; router binds affinity at provisioning ([#109](https://github.com/sympozium-ai/celln/issues/109)) ([bd17846](https://github.com/sympozium-ai/celln/commit/bd1784618ba011cddba4f559f80fb45437949539))
+* **router:** re-resolve --backends-srv so owners can join or leave live ([#110](https://github.com/sympozium-ai/celln/issues/110)) ([4c08bcd](https://github.com/sympozium-ai/celln/commit/4c08bcdba1e50df8d0227a8925651367445592a0))
+
 ## [0.5.10](https://github.com/sympozium-ai/celln/compare/v0.5.9...v0.5.10) (2026-09-11)
 
 
