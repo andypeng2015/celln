@@ -9,6 +9,9 @@ use serde_json::json;
 #[path = "dispatch_parent_process_tests.rs"]
 mod process_tests;
 
+/// Broker contexts one native parent charges: the parent plus its child.
+pub(super) const PARENT_EGRESS_SLOTS: u32 = 2;
+
 /// Test/internal capacity gate. Creation uses spawn_after_check to claim its
 /// durable identity after the same one-shot/prewarm capacity check. Artifact
 /// preparation then runs on the reserved owner thread before parent launch.
@@ -67,6 +70,7 @@ where
             incarnation,
             lifetime,
             reservation.memory_bytes,
+            reservation.egress_slots,
             initialize,
         )
         .map_err(anyhow::Error::msg)
@@ -758,9 +762,11 @@ fn create(
         };
         let id = admission.incarnation().clone();
         let lifetime = admission.lifetime();
+        // A native parent holds its own broker context and one for its single
+        // possible active child; both are charged for the owner's whole life.
         let reservation = Reservation {
             memory_bytes: admission.reserved_memory_bytes(),
-            egress_slots: 1,
+            egress_slots: PARENT_EGRESS_SLOTS,
         };
         // Claim is serialized after capacity checks but before owner creation.
         // Any subsequent failure is non-retryable for this incarnation.
@@ -967,6 +973,7 @@ mod tests {
                 &id,
                 Duration::from_secs(30),
                 4096,
+                0,
                 move |children| {
                     Ok(move |bytes: &[u8]| {
                         let turn = String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string())?;
@@ -1145,7 +1152,7 @@ mod tests {
         let (finished, done) = std::sync::mpsc::sync_channel(1);
         state
             .parents
-            .spawn_admitted("tenant", &id, Duration::from_secs(10), 4096, move || {
+            .spawn_admitted("tenant", &id, Duration::from_secs(10), 4096, 0, move || {
                 Ok(move |_: &[u8]| {
                     wait.recv_timeout(Duration::from_secs(2))
                         .map_err(|e| e.to_string())?;
@@ -1238,6 +1245,66 @@ mod tests {
         }
     }
 
+    /// Owners charge exact broker contexts, so `--egress-slots` bounds
+    /// concurrent parents per node instead of the first parent zeroing it.
+    #[test]
+    fn egress_slots_bound_concurrent_parents_and_return_on_stop() {
+        type Handler = fn(&[u8]) -> std::result::Result<Vec<u8>, String>;
+        let root = tempfile::tempdir().unwrap();
+        let mut state = super::super::tests::lifecycle_state(root.path());
+        state.probe.max_cells = 8;
+        state.probe.egress_slots = 2 * PARENT_EGRESS_SLOTS;
+        let reservation = Reservation {
+            memory_bytes: 4096,
+            egress_slots: PARENT_EGRESS_SLOTS,
+        };
+        for name in [&b"one"[..], b"two"] {
+            spawn_admitted(
+                &state,
+                "tenant",
+                &Hash::of(name),
+                Duration::from_secs(10),
+                reservation,
+                || Ok(|_: &[u8]| Ok(vec![1])),
+            )
+            .unwrap();
+        }
+        let node = current_node(&state, &state.executions.lock().unwrap());
+        assert_eq!(node.live_cells, 4);
+        assert_eq!(node.egress_slots, 0);
+        assert_eq!(
+            state.parents.reserved_capacity().unwrap().egress_slots,
+            2 * PARENT_EGRESS_SLOTS
+        );
+        // Cells and memory remain; broker contexts are the binding limit.
+        assert!(spawn_admitted(
+            &state,
+            "tenant",
+            &Hash::of(b"three"),
+            Duration::from_secs(10),
+            reservation,
+            || -> std::result::Result<Handler, String> {
+                panic!("capacity refusal must not initialize a runtime")
+            }
+        )
+        .is_err());
+        state.parents.stop("tenant", &Hash::of(b"one")).unwrap();
+        let node = current_node(&state, &state.executions.lock().unwrap());
+        assert_eq!(node.egress_slots, PARENT_EGRESS_SLOTS);
+        spawn_admitted(
+            &state,
+            "tenant",
+            &Hash::of(b"three"),
+            Duration::from_secs(10),
+            reservation,
+            || Ok(|_: &[u8]| Ok(vec![1])),
+        )
+        .unwrap();
+        for name in [&b"two"[..], b"three"] {
+            state.parents.stop("tenant", &Hash::of(name)).unwrap();
+        }
+    }
+
     #[test]
     fn http_session_commits_turn_and_reads_journal_after_stop() {
         let root = tempfile::tempdir().unwrap();
@@ -1253,6 +1320,7 @@ mod tests {
             &id,
             Duration::from_secs(10),
             4096,
+            0,
             move || {
                 let journal = warden::parent_journal::ParentJournal::create(
                     &journal_root,
@@ -1336,7 +1404,7 @@ mod tests {
         let id = Hash::of(b"incarnation");
         state
             .parents
-            .spawn_admitted("tenant-one", &id, Duration::from_secs(10), 4096, || {
+            .spawn_admitted("tenant-one", &id, Duration::from_secs(10), 4096, 0, || {
                 Ok(|_: &[u8]| Ok(br#"{"kind":"completed"}"#.to_vec()))
             })
             .unwrap();

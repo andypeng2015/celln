@@ -26,10 +26,14 @@ struct Entry {
     owner: Option<ParentOwner>,
     status: Status,
     reserved_bytes: u64,
+    /// Broker (egress) contexts this owner charges while live: the parent's
+    /// own plus its one possible active child.
+    reserved_egress: u32,
 }
 struct State {
     entries: BTreeMap<String, Entry>,
     reserved_bytes: u64,
+    reserved_egress: u32,
     draining: bool,
 }
 pub struct ParentRegistry {
@@ -43,6 +47,8 @@ pub struct ParentRegistry {
 pub struct ReservedCapacity {
     pub owners: u32,
     pub memory_bytes: u64,
+    /// Exact broker-slot charge of every live owner, released with its memory.
+    pub egress_slots: u32,
 }
 
 impl ParentRegistry {
@@ -81,7 +87,9 @@ impl ParentRegistry {
             if joined {
                 entry.status = Status::ContextLost;
                 let bytes = std::mem::take(&mut entry.reserved_bytes);
+                let egress = std::mem::take(&mut entry.reserved_egress);
                 state.reserved_bytes -= bytes;
+                state.reserved_egress -= egress;
                 released += 1;
             } else {
                 entry.status = Status::TeardownUncertain;
@@ -102,6 +110,7 @@ impl ParentRegistry {
                 .filter(|entry| entry.reserved_bytes != 0)
                 .count() as u32,
             memory_bytes: state.reserved_bytes,
+            egress_slots: state.reserved_egress,
         })
     }
     /// Budget must include parent, child and retained warm-mote memory as
@@ -115,6 +124,7 @@ impl ParentRegistry {
             state: Mutex::new(State {
                 entries: BTreeMap::new(),
                 reserved_bytes: 0,
+                reserved_egress: 0,
                 draining: false,
             }),
             max_entries,
@@ -131,15 +141,20 @@ impl ParentRegistry {
         incarnation: &Hash,
         lifetime: Duration,
         reserved_bytes: u64,
+        reserved_egress: u32,
         initialize: F,
     ) -> Result<(), String>
     where
         F: FnOnce() -> Result<H, String> + Send + 'static,
         H: FnMut(&[u8]) -> Result<Vec<u8>, String> + 'static,
     {
-        self.insert_admitted(principal, incarnation, reserved_bytes, || {
-            ParentOwner::spawn(lifetime, initialize)
-        })
+        self.insert_admitted(
+            principal,
+            incarnation,
+            reserved_bytes,
+            reserved_egress,
+            || ParentOwner::spawn(lifetime, initialize),
+        )
     }
 
     /// Native runtimes explicitly opt in to exact child cancellation. Legacy
@@ -150,6 +165,7 @@ impl ParentRegistry {
         incarnation: &Hash,
         lifetime: Duration,
         reserved_bytes: u64,
+        reserved_egress: u32,
         initialize: F,
     ) -> Result<(), String>
     where
@@ -160,9 +176,13 @@ impl ParentRegistry {
             + 'static,
         H: FnMut(&[u8]) -> Result<Vec<u8>, String> + 'static,
     {
-        self.insert_admitted(principal, incarnation, reserved_bytes, || {
-            ParentOwner::spawn_with_children(incarnation.clone(), lifetime, initialize)
-        })
+        self.insert_admitted(
+            principal,
+            incarnation,
+            reserved_bytes,
+            reserved_egress,
+            || ParentOwner::spawn_with_children(incarnation.clone(), lifetime, initialize),
+        )
     }
 
     fn insert_admitted(
@@ -170,6 +190,7 @@ impl ParentRegistry {
         principal: &str,
         incarnation: &Hash,
         reserved_bytes: u64,
+        reserved_egress: u32,
         spawn: impl FnOnce() -> std::io::Result<ParentOwner>,
     ) -> Result<(), String> {
         if principal.is_empty() || principal.len() > 512 || reserved_bytes == 0 {
@@ -192,8 +213,13 @@ impl ParentRegistry {
         if state.entries.len() >= self.max_entries || total > self.memory_bytes {
             return Err("parent registry capacity exhausted".into());
         }
+        let total_egress = state
+            .reserved_egress
+            .checked_add(reserved_egress)
+            .ok_or("parent egress capacity exhausted")?;
         let owner = spawn().map_err(|e| e.to_string())?;
         state.reserved_bytes = total;
+        state.reserved_egress = total_egress;
         state.entries.insert(
             incarnation.0.clone(),
             Entry {
@@ -201,6 +227,7 @@ impl ParentRegistry {
                 owner: Some(owner),
                 status: Status::Initializing,
                 reserved_bytes,
+                reserved_egress,
             },
         );
         Ok(())
@@ -345,7 +372,9 @@ impl ParentRegistry {
         if result.is_ok() {
             entry.status = Status::Stopped;
             let released = std::mem::take(&mut entry.reserved_bytes);
+            let egress = std::mem::take(&mut entry.reserved_egress);
             state.reserved_bytes -= released;
+            state.reserved_egress -= egress;
         } else {
             entry.status = Status::TeardownUncertain;
         }
@@ -365,7 +394,7 @@ fn scoped<'a>(state: &'a State, principal: &str, incarnation: &Hash) -> Result<&
 mod tests {
     use super::*;
     fn spawn(registry: &ParentRegistry, id: &Hash) -> Result<(), String> {
-        registry.spawn_admitted("tenant-one", id, Duration::from_secs(10), 100, || {
+        registry.spawn_admitted("tenant-one", id, Duration::from_secs(10), 100, 0, || {
             Ok(|bytes: &[u8]| Ok(bytes.to_vec()))
         })
     }
@@ -443,6 +472,7 @@ mod tests {
                 &expired,
                 Duration::from_millis(20),
                 100,
+                2,
                 || Ok(|bytes: &[u8]| Ok(bytes.to_vec())),
             )
             .unwrap();
@@ -460,7 +490,8 @@ mod tests {
             registry.reserved_capacity().unwrap(),
             ReservedCapacity {
                 owners: 1,
-                memory_bytes: 100
+                memory_bytes: 100,
+                egress_slots: 0
             }
         );
         assert!(registry.submit("tenant-one", &expired, b"retry").is_err());
@@ -489,7 +520,7 @@ mod tests {
         let registry = ParentRegistry::new(2, 100).unwrap();
         let id = Hash::of(b"reap-panic");
         registry
-            .spawn_admitted("tenant-one", &id, Duration::from_secs(10), 100, || {
+            .spawn_admitted("tenant-one", &id, Duration::from_secs(10), 100, 0, || {
                 Ok(|_: &[u8]| -> Result<Vec<u8>, String> { panic!("test panic") })
             })
             .unwrap();
@@ -511,7 +542,8 @@ mod tests {
             registry.reserved_capacity().unwrap(),
             ReservedCapacity {
                 owners: 1,
-                memory_bytes: 100
+                memory_bytes: 100,
+                egress_slots: 0
             }
         );
         assert!(registry.stop("tenant-one", &id).is_err());
@@ -522,7 +554,7 @@ mod tests {
         let registry = ParentRegistry::new(2, 100).unwrap();
         let id = Hash::of(b"panic");
         registry
-            .spawn_admitted("tenant-one", &id, Duration::from_secs(10), 100, || {
+            .spawn_admitted("tenant-one", &id, Duration::from_secs(10), 100, 0, || {
                 Ok(|_: &[u8]| -> Result<Vec<u8>, String> { panic!("test owner panic") })
             })
             .unwrap();
@@ -542,7 +574,8 @@ mod tests {
             registry.reserved_capacity().unwrap(),
             ReservedCapacity {
                 owners: 1,
-                memory_bytes: 100
+                memory_bytes: 100,
+                egress_slots: 0
             }
         );
         assert!(spawn(&registry, &Hash::of(b"new")).is_err());
@@ -561,6 +594,7 @@ mod tests {
                 &one,
                 Duration::from_secs(10),
                 100,
+                0,
                 move || {
                     Ok(move |_: &[u8]| {
                         started.send(()).unwrap();
@@ -605,6 +639,7 @@ mod tests {
                 &parent,
                 Duration::from_secs(30),
                 4096,
+                0,
                 move |children| {
                     Ok(move |bytes: &[u8]| {
                         let turn = String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string())?;
@@ -666,7 +701,7 @@ mod tests {
 
         let legacy = Hash::of(b"legacy-parent");
         registry
-            .spawn_admitted("tenant", &legacy, Duration::from_secs(30), 4096, || {
+            .spawn_admitted("tenant", &legacy, Duration::from_secs(30), 4096, 0, || {
                 Ok(|_: &[u8]| Ok(vec![]))
             })
             .unwrap();

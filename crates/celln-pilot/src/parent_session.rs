@@ -33,6 +33,7 @@ pub fn spawn_registered<F, P, W>(
     incarnation: &Hash,
     lifetime: std::time::Duration,
     reserved_bytes: u64,
+    reserved_egress: u32,
     initialize: F,
 ) -> Result<()>
 where
@@ -46,6 +47,7 @@ where
             incarnation,
             lifetime,
             reserved_bytes,
+            reserved_egress,
             move || {
                 let mut session = initialize().map_err(|e| e.to_string())?;
                 Ok(move |bytes: &[u8]| session.submit(bytes).map_err(|e| e.to_string()))
