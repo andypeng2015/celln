@@ -88,6 +88,67 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 struct Health {
     ok: bool,
     kvm: bool,
+    /// Present on dispatchers that report their live budget; absent on older
+    /// ones, which are then placed as if they had no spare capacity.
+    #[serde(default)]
+    node: Option<HealthNode>,
+}
+
+#[derive(Debug, serde::Deserialize, Default, Clone, Copy)]
+struct HealthNode {
+    #[serde(default)]
+    live_cells: u32,
+    #[serde(default)]
+    max_cells: u32,
+    #[serde(default)]
+    memory_bytes: u64,
+}
+
+impl Health {
+    /// Spare cells and memory the owner advertises right now.
+    fn spare(&self) -> (u32, u64) {
+        let node = self.node.unwrap_or_default();
+        (
+            node.max_cells.saturating_sub(node.live_cells),
+            node.memory_bytes,
+        )
+    }
+}
+
+/// Places a new parent on the healthy owner with the most spare cells (then
+/// memory). Ties keep the hash order, so equally free owners spread parents
+/// deterministically. Once provisioned, the ownership ledger binds the parent
+/// to that owner for good; this choice happens exactly once per incarnation.
+fn pick_owner(state: &RouterState, action_id: &str, token: &Option<String>) -> Result<String> {
+    let backends = state.backends();
+    let n = backends.len();
+    if n == 0 {
+        bail!("no dispatcher backends configured or discovered");
+    }
+    let start = (fnv1a(action_id.as_bytes()) as usize) % n;
+    let mut best: Option<(String, (u32, u64))> = None;
+    for offset in 0..n {
+        let backend = &backends[(start + offset) % n];
+        let Ok(Some(health)) = health_of(backend, token) else {
+            continue;
+        };
+        let spare = health.spare();
+        if best.as_ref().map_or(true, |(_, current)| spare > *current) {
+            best = Some((backend.clone(), spare));
+        }
+    }
+    best.map(|(backend, _)| backend)
+        .ok_or_else(|| anyhow::anyhow!("no healthy dispatcher backends among {n} candidates"))
+}
+
+fn health_of(backend: &str, token: &Option<String>) -> Result<Option<Health>> {
+    let resp = forward_get(backend, "/v1/health", token)?;
+    if parse_status(&resp) != 200 {
+        return Ok(None);
+    }
+    Ok(serde_json::from_str::<Health>(extract_body(&resp))
+        .ok()
+        .filter(|h| h.ok && h.kvm))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -807,17 +868,7 @@ fn pick_backend(state: &RouterState, action_id: &str, token: &Option<String>) ->
 }
 
 fn is_healthy(backend: &str, token: &Option<String>) -> Result<bool> {
-    let resp = forward_get(backend, "/v1/health", token)?;
-    match parse_status(&resp) {
-        200 => {
-            let body = extract_body(&resp);
-            match serde_json::from_str::<Health>(body) {
-                Ok(h) => Ok(h.ok && h.kvm),
-                Err(_) => Ok(false),
-            }
-        }
-        _ => Ok(false),
-    }
+    Ok(health_of(backend, token)?.is_some())
 }
 
 fn forward_get(backend: &str, path: &str, token: &Option<String>) -> Result<String> {
@@ -1654,6 +1705,103 @@ mod tests {
                 plan
             )),
             503
+        );
+    }
+
+    #[test]
+    fn parent_provisioning_prefers_the_roomiest_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = state(dir.path());
+        let parent_file = dir.path().join("parent-token");
+        const PARENT: &str = "parent-principal-credential-at-least-24";
+        std::fs::write(&parent_file, PARENT).unwrap();
+        first.parent_token_file = Some(parent_file);
+        let id = format!("blake3:{}", "a".repeat(64));
+        let launch = format!("blake3:{}", "b".repeat(64));
+        // An owner answers health with its live budget and provisions on demand.
+        let owner = |live: u32, max: u32, provisions: Arc<AtomicUsize>| {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let id = id.clone();
+            let launch = launch.clone();
+            std::thread::spawn(move || {
+                for mut stream in listener.incoming().flatten() {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let line = read_bounded_line(&mut reader, MAX_REQUEST_LINE).unwrap();
+                    let mut length = 0;
+                    loop {
+                        let h = read_bounded_line(&mut reader, MAX_HEADER_LINE).unwrap();
+                        if h.trim().is_empty() {
+                            break;
+                        }
+                        if let Some(v) = h.strip_prefix("Content-Length:") {
+                            length = v.trim().parse::<usize>().unwrap();
+                        }
+                    }
+                    let mut bytes = vec![0; length];
+                    reader.read_exact(&mut bytes).unwrap();
+                    if line.starts_with("GET /v1/health") {
+                        reply(&mut stream, 200, &serde_json::json!({"ok":true,"kvm":true,"node":{"live_cells":live,"max_cells":max,"memory_bytes":1u64<<30}})).unwrap();
+                    } else {
+                        provisions.fetch_add(1, Ordering::SeqCst);
+                        reply(&mut stream, 200, &serde_json::json!({"apiVersion":"celln.parent-provisioned/v1","launchProfile":launch,"incarnation":id})).unwrap();
+                    }
+                }
+            });
+            url
+        };
+        let cramped_count = Arc::new(AtomicUsize::new(0));
+        let roomy_count = Arc::new(AtomicUsize::new(0));
+        let cramped = owner(6, 8, cramped_count.clone());
+        let roomy = owner(2, 8, roomy_count.clone());
+        // Put the cramped owner where the hash would land, so only capacity
+        // can move the parent.
+        let start = (fnv1a(id.as_bytes()) as usize) % 2;
+        first.backends = if start == 0 {
+            vec![cramped.clone(), roomy.clone()]
+        } else {
+            vec![roomy.clone(), cramped.clone()]
+        };
+        let plan =
+            r#"{"apiVersion":"celln.parent-provision-plan/v1","scope":"cluster","runUid":"run"}"#;
+        let headers = format!("Authorization: Bearer {CLIENT_TOKEN}\r\nX-Celln-Parent-Incarnation: {id}\r\nContent-Length: {}\r\n", plan.len());
+        assert_eq!(
+            parse_status(&request(
+                &first,
+                "POST",
+                "/v1/parents/provision",
+                &headers,
+                plan
+            )),
+            200
+        );
+        assert_eq!(
+            first.provisions.lookup(&id).unwrap().unwrap().backend,
+            roomy
+        );
+        assert_eq!(roomy_count.load(Ordering::SeqCst), 1);
+        assert_eq!(cramped_count.load(Ordering::SeqCst), 0);
+        // Equal capacity keeps the hash order deterministic.
+        std::fs::create_dir_all(dir.path().join("second")).unwrap();
+        let mut second = state(&dir.path().join("second"));
+        second.parent_token_file = first.parent_token_file.clone();
+        let even_a = owner(2, 8, Arc::new(AtomicUsize::new(0)));
+        let even_b = owner(2, 8, Arc::new(AtomicUsize::new(0)));
+        second.backends = vec![even_a.clone(), even_b.clone()];
+        let expected = second.backends[(fnv1a(id.as_bytes()) as usize) % 2].clone();
+        assert_eq!(
+            parse_status(&request(
+                &second,
+                "POST",
+                "/v1/parents/provision",
+                &headers,
+                plan
+            )),
+            200
+        );
+        assert_eq!(
+            second.provisions.lookup(&id).unwrap().unwrap().backend,
+            expected
         );
     }
 
