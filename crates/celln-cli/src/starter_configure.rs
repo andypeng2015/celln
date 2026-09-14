@@ -23,6 +23,49 @@ struct Plan {
     output: PathBuf,
     #[serde(default)]
     model_connection: Option<ModelConnection>,
+    /// Operator ceilings for one parent: how long it may live and how much
+    /// it may spend over its life. Absent fields keep the reviewed defaults.
+    #[serde(default)]
+    host_limits: Option<HostLimits>,
+}
+
+#[derive(Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HostLimits {
+    lease_seconds: Option<u64>,
+    max_turns: Option<u64>,
+    max_model_requests: Option<u64>,
+    max_output_tokens: Option<u64>,
+}
+
+/// Per-turn allowance of the starter model profile; parent totals must afford
+/// at least one such turn.
+const TURN_MODEL_REQUESTS: u64 = 3;
+const TURN_OUTPUT_TOKENS: u64 = 1536;
+
+struct ResolvedLimits {
+    lease_seconds: u64,
+    max_turns: u64,
+    max_model_requests: u64,
+    max_output_tokens: u64,
+}
+
+fn resolve_limits(limits: Option<&HostLimits>) -> Result<ResolvedLimits> {
+    let limits = limits.cloned().unwrap_or_default();
+    let resolved = ResolvedLimits {
+        lease_seconds: limits.lease_seconds.unwrap_or(3600),
+        max_turns: limits.max_turns.unwrap_or(12),
+        max_model_requests: limits.max_model_requests.unwrap_or(36),
+        max_output_tokens: limits.max_output_tokens.unwrap_or(18432),
+    };
+    ensure!(
+        (60..=86_400).contains(&resolved.lease_seconds)
+            && (1..=1024).contains(&resolved.max_turns)
+            && (TURN_MODEL_REQUESTS..=6144).contains(&resolved.max_model_requests)
+            && (TURN_OUTPUT_TOKENS..=3_145_728).contains(&resolved.max_output_tokens),
+        "host limits out of range: leaseSeconds 60..=86400, maxTurns 1..=1024, maxModelRequests 3..=6144, maxOutputTokens 1536..=3145728"
+    );
+    Ok(resolved)
 }
 
 #[derive(Deserialize)]
@@ -127,7 +170,8 @@ pub fn run(plan: &Path, root: &Path) -> Result<u8> {
             json!({"apiVersion":"celln.dev/v1alpha1","id":format!("native-{name}"),"workload":{"id":format!("native-{name}"),"caller":plan.principal},"mote":{"hash":bundle["mote"]},"tools":[{"alias":bundle["entryPoint"],"hash":bundle["executable"],"closure":{"hash":bundle["closure"]}}],"invocation":{"alias":bundle["entryPoint"],"args":[]},"capabilities":{"workspace":"none","timeoutMs":timeout,"memoryBytes":268435456u64,"outputBytes":65536},"execution":{"lane":"agent","requireHardwareIsolation":true}}),
         )?)
     };
-    let parent = request("parent", 3600000)?;
+    let limits = resolve_limits(plan.host_limits.as_ref())?;
+    let parent = request("parent", limits.lease_seconds * 1000)?;
     let worker = request("worker", 60000)?;
     let output_schema = json!({"type":"object","properties":{"revision":{"type":"integer","minimum":0,"maximum":65536},"content":{"type":"string","minLength":0,"maxLength":4096},"error":{"type":"string","minLength":1,"maxLength":1024}},"required":[],"additionalProperties":false}).to_string();
     let specifications = [
@@ -173,7 +217,7 @@ pub fn run(plan: &Path, root: &Path) -> Result<u8> {
     }
     let bundle = entry("worker");
     let catalogue = json!({"systemPrompt":template.policy().system,"tools":catalogue_tools,"worker":{"revision":"v1","contractVersion":"celln.json-tools/v1","publisherKey":bundle["publisher"],"executable":{"hash":bundle["executable"]},"closure":{"hash":bundle["closure"]},"mote":{"hash":bundle["mote"]},"entryPoint":"/worker","platform":"linux/amd64","lane":"agent","lifecycle":"disposable-one-shot","json":{"maxTurns":3,"maxCalls":1},"limits":{"timeoutMillis":60000,"memoryBytes":268435456u64,"taskBytes":2048,"outputBytes":65536,"workspace":"none"}}});
-    let native = json!({"admissionWindowMs":120000,"parent":parent,"worker":worker,"template":template.policy(),"modelProfile":profile_hash,"reservedMemoryBytes":1342177280u64,"maxTurns":12,"turnModelRequests":3,"turnOutputTokens":1536,"totalModelRequests":36,"totalOutputTokens":18432});
+    let native = json!({"admissionWindowMs":120000,"parent":parent,"worker":worker,"template":template.policy(),"modelProfile":profile_hash,"reservedMemoryBytes":1342177280u64,"maxTurns":limits.max_turns,"turnModelRequests":TURN_MODEL_REQUESTS,"turnOutputTokens":TURN_OUTPUT_TOKENS,"totalModelRequests":limits.max_model_requests,"totalOutputTokens":limits.max_output_tokens});
     let catalogue_bytes = serde_json::to_vec_pretty(&catalogue)?;
     let native_bytes = serde_json::to_vec_pretty(&native)?;
     fs::DirBuilder::new().mode(0o700).create(&plan.output)?;
@@ -191,7 +235,7 @@ pub fn run(plan: &Path, root: &Path) -> Result<u8> {
         write_new(&path, &profile)?;
     }
     fs::File::open(profiles)?.sync_all()?;
-    let mut complete = json!({"apiVersion":"celln.native-starter-configured/v1","packageHash":plan.package_hash,"catalogueHash":Hash::of(&catalogue_bytes),"nativeTemplateHash":Hash::of(&native_bytes),"principal":plan.principal,"modelProfile":profile_hash,"model":{"provider":"deepseek","model":"deepseek-chat"},"hostLimits":{"leaseSeconds":3600,"maxTurns":12,"maxModelRequests":36,"maxOutputTokens":18432},"executionAuthorized":false,"readiness":"not_established"});
+    let mut complete = json!({"apiVersion":"celln.native-starter-configured/v1","packageHash":plan.package_hash,"catalogueHash":Hash::of(&catalogue_bytes),"nativeTemplateHash":Hash::of(&native_bytes),"principal":plan.principal,"modelProfile":profile_hash,"model":{"provider":"deepseek","model":"deepseek-chat"},"hostLimits":{"leaseSeconds":limits.lease_seconds,"maxTurns":limits.max_turns,"maxModelRequests":limits.max_model_requests,"maxOutputTokens":limits.max_output_tokens},"executionAuthorized":false,"readiness":"not_established"});
     if let Some(c) = connection {
         complete["model"] = json!({"provider":c.provider,"protocol":c.protocol,"model":c.model,"baseURL":c.endpoint,"credentialProfile":c.credential_profile,"allowInsecure":c.allow_insecure});
     }
