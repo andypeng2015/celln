@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.12](https://github.com/sympozium-ai/celln/compare/v0.5.11...v0.5.12) (2026-09-14)
+
+
+### Bug Fixes
+
+* **dispatcher:** charge exact broker slots per parent so a node holds more than one parent ([a1aa888](https://github.com/sympozium-ai/celln/commit/a1aa88808ad9970f7a48c2e5150ed59a0e763c00))
+* **dispatcher:** charge exact broker slots per parent so a node holds more than one parent ([2341461](https://github.com/sympozium-ai/celln/commit/2341461a3d06b06d38aaca8a71f7fb36a2bca3f2))
+
 ## [0.5.11](https://github.com/sympozium-ai/celln/compare/v0.5.10...v0.5.11) (2026-09-14)
 
 
