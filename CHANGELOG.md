@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.13](https://github.com/sympozium-ai/celln/compare/v0.5.12...v0.5.13) (2026-09-14)
+
+
+### Bug Fixes
+
+* **dispatcher:** bound model requests by the turn deadline instead of a fixed 45 seconds ([24b30c0](https://github.com/sympozium-ai/celln/commit/24b30c000a363dc9d227c9f074d0a76dad9eb024))
+* **dispatcher:** bound model requests by the turn deadline instead of a fixed 45 seconds ([7be438c](https://github.com/sympozium-ai/celln/commit/7be438c08fee16805cfbb1d1a4f4c101db612591))
+
 ## [0.5.12](https://github.com/sympozium-ai/celln/compare/v0.5.11...v0.5.12) (2026-09-14)
 
 
