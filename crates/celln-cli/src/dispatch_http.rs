@@ -232,12 +232,9 @@ fn current_node(
                 .live_cells
                 .saturating_add(reserved.owners.saturating_mul(2));
             node.memory_bytes = node.memory_bytes.saturating_sub(reserved.memory_bytes);
-            if reserved.owners != 0 {
-                // Parent registry does not yet carry exact broker-slot charges.
-                // Do not advertise spare egress until creation admission binds
-                // those charges and shares this node's admission lock.
-                node.egress_slots = 0;
-            }
+            // Each owner charged its exact broker contexts at admission under
+            // this node's admission lock; subtract them like one-shot cells.
+            node.egress_slots = node.egress_slots.saturating_sub(reserved.egress_slots);
         }
         Err(_) => {
             node.live_cells = node.max_cells;
@@ -1126,6 +1123,7 @@ mod tests {
                 &id,
                 Duration::from_secs(10),
                 128 << 20,
+                1,
                 move || {
                     Ok(move |_: &[u8]| {
                         entered.send(()).unwrap();
@@ -1139,7 +1137,8 @@ mod tests {
         let node = current_node(&state, &registry);
         assert_eq!(node.live_cells, 2);
         assert_eq!(node.memory_bytes, 128 << 20);
-        assert_eq!(node.egress_slots, 0);
+        // The owner charged exactly one broker context; the other stays advertised.
+        assert_eq!(node.egress_slots, 1);
         let response = state.parents.submit("tenant", &id, b"work").unwrap();
         ready.recv_timeout(Duration::from_secs(2)).unwrap();
         state.parents.cancel("tenant", &id).unwrap();
