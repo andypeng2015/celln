@@ -183,18 +183,24 @@ impl PreparedWorker {
             outcome.denial.as_deref(),
             celln_control::current().and_then(|control| control.reason()),
         );
-        let answer = if cancelled {
-            "Turn cancelled after child teardown.".into()
+        // The child ran in its own cell; the parent's context is intact
+        // whatever happened to it. A child that failed (a refused or failing
+        // model request, a timeout, a crash) is a failed turn the caller can
+        // read and follow up on, never lost parent context.
+        let (succeeded, answer) = if cancelled {
+            (false, "Turn cancelled after child teardown.".into())
+        } else if let Some(reason) = failure_reason(&outcome) {
+            (false, reason)
         } else {
-            if outcome.denial.is_some() || outcome.timed_out || outcome.exit_code != Some(0) {
-                return Err("native worker failed; child torn down, no result committed".into());
-            }
-            answer(
-                outcome
-                    .output
-                    .as_deref()
-                    .ok_or("missing native worker output")?,
-            )?
+            (
+                true,
+                answer(
+                    outcome
+                        .output
+                        .as_deref()
+                        .ok_or("missing native worker output")?,
+                )?,
+            )
         };
         // Explicit host opt-in only: contains sensitive conversation/tool data,
         // never authority to replay. Default production operation retains none.
@@ -205,16 +211,60 @@ impl PreparedWorker {
                 &serde_json::to_vec_pretty(&serde_json::json!({"broker":outcome.broker,
                 "output":String::from_utf8_lossy(outcome.output.as_deref().unwrap_or_default()),
                 "cancelled":cancelled,
+                "succeeded":succeeded,
                 "execution":outcome.execution}))
                 .map_err(|e| e.to_string())?,
             )?;
         }
         Ok(pilot::parent_session::DestroyedChild {
             child: turn.child.clone(),
-            succeeded: !cancelled,
+            succeeded,
             answer,
         })
     }
+}
+
+/// Bound on the failure text committed as a failed turn's answer.
+const FAILURE_ANSWER_BYTES: usize = 1024;
+
+/// Why a destroyed child produced no answer, with a bounded tail of what it
+/// printed (typically the model refusal or provider error), or None when it
+/// exited cleanly. Only called after the child's VM is gone.
+fn failure_reason(outcome: &super::super::LaunchOutcome) -> Option<String> {
+    let cause = if outcome.timed_out {
+        "child timed out".to_string()
+    } else if let Some(denial) = &outcome.denial {
+        format!("child refused: {denial}")
+    } else if let Some(signal) = outcome.signal {
+        format!("child stopped by signal {signal}")
+    } else if outcome.exit_code != Some(0) {
+        match outcome.exit_code {
+            Some(code) => format!("child exited with status {code}"),
+            None => "child exited without a status".to_string(),
+        }
+    } else {
+        return None;
+    };
+    let mut reason = format!("Turn failed; no result committed: {cause}");
+    let printed: String = String::from_utf8_lossy(outcome.output.as_deref().unwrap_or_default())
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !printed.is_empty() {
+        reason.push_str(": ");
+        reason.push_str(&printed);
+    }
+    if reason.len() > FAILURE_ANSWER_BYTES {
+        let mut end = FAILURE_ANSWER_BYTES;
+        while !reason.is_char_boundary(end) {
+            end -= 1;
+        }
+        reason.truncate(end);
+    }
+    Some(reason)
 }
 
 // Only called on the successful, VM-destroyed return path of the executor.
@@ -327,6 +377,56 @@ fn answer(output: &[u8]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn outcome(exit_code: Option<i32>, output: &str) -> super::super::super::LaunchOutcome {
+        super::super::super::LaunchOutcome {
+            execution: None,
+            substrate: None,
+            broker: Default::default(),
+            lifecycle: vec![],
+            input_hashes: vec![],
+            cell_id: "child".into(),
+            output: Some(output.as_bytes().to_vec()),
+            denial: None,
+            exit_code,
+            signal: None,
+            timed_out: false,
+        }
+    }
+
+    // A child that failed is a failed turn with a readable reason, never an
+    // owner error: the parent's context survives a provider outage or a bad
+    // credential and the caller can ask again.
+    #[test]
+    fn child_failure_is_a_failed_turn_with_its_printed_reason() {
+        assert_eq!(failure_reason(&outcome(Some(0), "fine")), None);
+        let failed = failure_reason(&outcome(
+            Some(1),
+            "model request failed: HTTP 503\nService is too busy.",
+        ))
+        .unwrap();
+        assert_eq!(
+            failed,
+            "Turn failed; no result committed: child exited with status 1: model request failed: HTTP 503 Service is too busy."
+        );
+        let mut refused = outcome(Some(1), "");
+        refused.denial = Some("provider credential unavailable".into());
+        assert_eq!(
+            failure_reason(&refused).unwrap(),
+            "Turn failed; no result committed: child refused: provider credential unavailable"
+        );
+        let mut timed = outcome(None, "");
+        timed.timed_out = true;
+        assert!(failure_reason(&timed).unwrap().contains("child timed out"));
+        let mut signalled = outcome(None, "\u{7}beep");
+        signalled.signal = Some(9);
+        assert_eq!(
+            failure_reason(&signalled).unwrap(),
+            "Turn failed; no result committed: child stopped by signal 9: beep"
+        );
+        let long = failure_reason(&outcome(Some(2), &"é".repeat(4000))).unwrap();
+        assert!(long.len() <= FAILURE_ANSWER_BYTES && long.is_char_boundary(long.len()));
+    }
     #[test]
     fn worker_closure_cannot_expand_or_substitute_borrowed_tools() {
         use celln_manifest::closure::{Closure, Member};
