@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.15](https://github.com/sympozium-ai/celln/compare/v0.5.14...v0.5.15) (2026-09-14)
+
+
+### Features
+
+* **starter:** operator host limits — lease up to 24h, turn and token ceilings per plan ([c922759](https://github.com/sympozium-ai/celln/commit/c922759c9923e930f9c950112cad6232e4c90ea6))
+* **starter:** operator host limits — lease up to 24h, turn and token ceilings per plan ([74817f1](https://github.com/sympozium-ai/celln/commit/74817f1d32852c261691883cc0eb43162496ef59))
+
 ## [0.5.14](https://github.com/sympozium-ai/celln/compare/v0.5.13...v0.5.14) (2026-09-14)
 
 
