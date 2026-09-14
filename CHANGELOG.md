@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.14](https://github.com/sympozium-ai/celln/compare/v0.5.13...v0.5.14) (2026-09-14)
+
+
+### Bug Fixes
+
+* **egress:** accept Anthropic thinking blocks without forwarding them ([bbfab46](https://github.com/sympozium-ai/celln/commit/bbfab4653253a0a55985d19da8c462bad1924de6))
+* **egress:** accept Anthropic thinking blocks without forwarding them ([a8c8682](https://github.com/sympozium-ai/celln/commit/a8c8682d929bbbdd28220242125340836a840d02))
+
 ## [0.5.13](https://github.com/sympozium-ai/celln/compare/v0.5.12...v0.5.13) (2026-09-14)
 
 
