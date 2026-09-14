@@ -372,6 +372,10 @@ fn provider_response(raw: Vec<u8>, protocol: ModelProtocol) -> Result<Vec<u8>, F
                 }
                 calls.push(json!({"id":id,"type":"function","function":{"name":name,"arguments":block["input"].to_string()}}));
             }
+            // Reasoning is not part of the answer or the transcript the
+            // guest sees; providers (and Anthropic-compatible servers such as
+            // llama-server) may send it unrequested.
+            Some("thinking" | "redacted_thinking") => {}
             _ => return Err(refused("unsupported provider content block")),
         }
     }
@@ -544,6 +548,27 @@ mod tests {
         );
         assert_eq!(normalized["choices"][0]["finish_reason"], "tool_calls");
         assert_eq!(normalized["usage"]["total_tokens"], 19);
+        // Reasoning blocks are dropped, never forwarded as text.
+        let thinking = json!({"content":[{"type":"thinking","thinking":"private chain","signature":""},{"type":"redacted_thinking","data":"x"},{"type":"tool_use","id":"t1","name":"read","input":{}}],"stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1}});
+        let normalized: serde_json::Value = serde_json::from_slice(
+            &provider_response(
+                serde_json::to_vec(&thinking).unwrap(),
+                ModelProtocol::AnthropicMessages,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(normalized["choices"][0]["message"]["content"], "");
+        assert_eq!(
+            normalized["choices"][0]["message"]["tool_calls"][0]["id"],
+            "t1"
+        );
+        let unknown = json!({"content":[{"type":"image","source":{}}],"stop_reason":"end_turn"});
+        assert!(provider_response(
+            serde_json::to_vec(&unknown).unwrap(),
+            ModelProtocol::AnthropicMessages
+        )
+        .is_err());
         assert_eq!(
             provider_request(&body, ModelProtocol::OpenaiChat).unwrap(),
             body
