@@ -106,7 +106,7 @@ pub(super) fn forward(
         }
         match state
             .provisions
-            .claim(id, &body, || pick_backend(state, id, backend_token))
+            .claim(id, &body, || pick_owner(state, id, backend_token))
         {
             Ok(ownership::Claim::New(owner)) | Ok(ownership::Claim::Existing(owner)) => {
                 owner.backend
@@ -144,7 +144,7 @@ pub(super) fn forward(
         // owner that issued them, so creation follows that binding.
         let choose = || match state.provisions.lookup(id)? {
             Some(owner) => Ok(owner.backend),
-            None => pick_backend(state, id, backend_token),
+            None => pick_owner(state, id, backend_token),
         };
         match state.parents.claim(id, &body, choose) {
             Ok(ownership::Claim::New(owner)) => owner.backend,
