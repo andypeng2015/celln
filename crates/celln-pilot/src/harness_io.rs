@@ -45,11 +45,7 @@ pub fn child(
     timeout: Duration,
 ) -> Result<Vec<u8>> {
     ensure!(
-        input.len() <= 65536
-            && output_limit > 0
-            && output_limit <= 1_048_576
-            && !timeout.is_zero()
-            && timeout <= Duration::from_secs(45),
+        input.len() <= 65536 && output_limit > 0 && output_limit <= 1_048_576 && !timeout.is_zero(),
         "invalid child budget"
     );
     let mut child = Command::new(path)

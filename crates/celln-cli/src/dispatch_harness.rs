@@ -185,9 +185,8 @@ fn resolve_bytes(
     let mut policy = warden::egress::HttpPolicy::new(vec![target.host.clone()]);
     policy.max_requests = grant.max_requests;
     policy.allow_insecure = grant.allow_insecure;
-    policy.timeout = std::time::Duration::from_secs(45).min(std::time::Duration::from_millis(
-        request.capabilities.timeout_ms,
-    ));
+    // Bounded by the cell's own lifetime, not a fixed per-request cap.
+    policy.timeout = std::time::Duration::from_millis(request.capabilities.timeout_ms);
     policy.json_posts.push(warden::egress::JsonPostGrant {
         protocol: grant.protocol,
         url: grant.url.clone(),

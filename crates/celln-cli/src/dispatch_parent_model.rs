@@ -246,7 +246,9 @@ impl ChildBrokers {
         }
         let target = warden::egress::model_endpoint_target(&profile.url, profile.allow_insecure)?;
         let mut policy = warden::egress::HttpPolicy::new(vec![target.host.clone()]);
-        policy.timeout = turn.limits.timeout.min(std::time::Duration::from_secs(45));
+        // A model request may use the whole turn: slow local models are
+        // legitimate, and the turn deadline is the enforced bound.
+        policy.timeout = turn.limits.timeout;
         policy.max_requests = profile.max_requests as usize;
         policy.allow_insecure = profile.allow_insecure;
         let get = match profile.fetch {
