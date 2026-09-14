@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.16](https://github.com/sympozium-ai/celln/compare/v0.5.15...v0.5.16) (2026-09-14)
+
+
+### Features
+
+* **router:** place new parents on the owner with the most spare capacity ([8d515bd](https://github.com/sympozium-ai/celln/commit/8d515bd8cfdcc665a4fdfabbcfe1fc8a3ab76d40))
+* **router:** place new parents on the owner with the most spare capacity ([38e5d14](https://github.com/sympozium-ai/celln/commit/38e5d147144db3640cad9639cd02f0e52cea0b44))
+
 ## [0.5.15](https://github.com/sympozium-ai/celln/compare/v0.5.14...v0.5.15) (2026-09-14)
 
 
