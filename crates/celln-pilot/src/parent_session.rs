@@ -98,6 +98,34 @@ where
         self
     }
 
+    /// Give a new parent the memory of the conversation it continues. Sent
+    /// once by the owner from the provision plan before any turn; the parent
+    /// refuses a seed after its context is in use, so a client can never
+    /// reach this through a turn.
+    pub fn seed(&mut self, history: &[crate::json_harness::Exchange]) -> Result<()> {
+        ensure!(!self.closed, "parent session closed");
+        crate::parent_harness::validate_seed(history).map_err(anyhow::Error::msg)?;
+        let response = (self.parent)(&serde_json::to_vec(&serde_json::json!({
+            "kind":"seed", "apiVersion":VERSION, "history":history
+        }))?)?;
+        ensure!(
+            response.len() <= warden::parent_mailbox::MAX_FRAME_BYTES,
+            "parent response overflow"
+        );
+        let ParentReply::Seeded {
+            api_version,
+            exchanges,
+        } = serde_json::from_slice(&response)?
+        else {
+            anyhow::bail!("parent did not accept the seed");
+        };
+        ensure!(
+            api_version == VERSION && exchanges == history.len(),
+            "parent seed acknowledgement mismatch"
+        );
+        Ok(())
+    }
+
     /// Only user turns enter here. Result envelopes are created internally
     /// from the independently bound executor, never accepted from a client.
     pub fn submit(&mut self, input: &[u8]) -> Result<Vec<u8>> {
