@@ -27,6 +27,33 @@ struct Plan {
     /// it may spend over its life. Absent fields keep the reviewed defaults.
     #[serde(default)]
     host_limits: Option<HostLimits>,
+    /// Exact hosts the fetch and JSON POST tools may reach; the reviewed
+    /// default is example.com. Lowercase DNS names, at most 16.
+    #[serde(default)]
+    https_hosts: Option<Vec<String>>,
+}
+
+fn resolve_hosts(hosts: Option<&Vec<String>>) -> Result<Vec<String>> {
+    let hosts = hosts.cloned().unwrap_or_else(|| vec!["example.com".into()]);
+    ensure!(
+        !hosts.is_empty()
+            && hosts.len() <= 16
+            && hosts.iter().all(|host| {
+                host.len() <= 253
+                    && host.contains('.')
+                    && host.split('.').all(|label| {
+                        !label.is_empty()
+                            && label.len() <= 63
+                            && !label.starts_with('-')
+                            && !label.ends_with('-')
+                            && label
+                                .bytes()
+                                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                    })
+            }),
+        "httpsHosts must be 1..=16 lowercase DNS names"
+    );
+    Ok(hosts)
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -171,25 +198,71 @@ pub fn run(plan: &Path, root: &Path) -> Result<u8> {
         )?)
     };
     let limits = resolve_limits(plan.host_limits.as_ref())?;
+    let hosts = resolve_hosts(plan.https_hosts.as_ref())?;
     let parent = request("parent", limits.lease_seconds * 1000)?;
     let worker = request("worker", 60000)?;
-    let output_schema = json!({"type":"object","properties":{"revision":{"type":"integer","minimum":0,"maximum":65536},"content":{"type":"string","minLength":0,"maxLength":4096},"error":{"type":"string","minLength":1,"maxLength":1024}},"required":[],"additionalProperties":false}).to_string();
+    let error = json!({"type":"string","minLength":1,"maxLength":1024});
+    let revision = json!({"type":"integer","minimum":0,"maximum":65536});
+    let name = json!({"type":"string","minLength":1,"maxLength":256});
+    let content = json!({"type":"string","minLength":0,"maxLength":4096});
+    let output_schema = json!({"type":"object","properties":{"revision":revision,"content":content,"error":error},"required":[],"additionalProperties":false}).to_string();
+    let list_output = json!({"type":"object","properties":{"revision":revision,"files":{"type":"array","minItems":0,"maxItems":64,"items":{"type":"object","properties":{"name":name,"bytes":{"type":"integer","minimum":0,"maximum":1048576}},"required":["name","bytes"],"additionalProperties":false}},"error":error},"required":[],"additionalProperties":false}).to_string();
+    let search_output = json!({"type":"object","properties":{"revision":revision,"matches":{"type":"array","minItems":0,"maxItems":32,"items":{"type":"object","properties":{"name":name,"line":{"type":"integer","minimum":1,"maximum":1048576},"text":{"type":"string","minLength":0,"maxLength":256}},"required":["name","line","text"],"additionalProperties":false}},"error":error},"required":[],"additionalProperties":false}).to_string();
+    let post_output = json!({"type":"object","properties":{"status":{"type":"integer","minimum":100,"maximum":599},"content":content,"error":error},"required":[],"additionalProperties":false}).to_string();
+    // Descriptions are what the model reads; names alone leave it guessing
+    // which revision to pass or what a search returns.
     let specifications = [
         (
             "workspace-read",
-            json!({"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":256}},"required":["name"],"additionalProperties":false}),
+            "Read a run file by name; returns its content and the workspace revision.",
+            json!({"type":"object","properties":{"name":name},"required":["name"],"additionalProperties":false}),
+            output_schema.clone(),
         ),
         (
             "workspace-write",
-            json!({"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":256},"revision":{"type":"integer","minimum":0,"maximum":65536},"content":{"type":"string","minLength":0,"maxLength":4096}},"required":["name","revision","content"],"additionalProperties":false}),
+            "Replace or create a run file at the given workspace revision (0 for an empty workspace).",
+            json!({"type":"object","properties":{"name":name,"revision":revision,"content":content},"required":["name","revision","content"],"additionalProperties":false}),
+            output_schema.clone(),
         ),
         (
             "https-fetch",
+            "GET an HTTPS URL on an allowed host; returns the body as text.",
             json!({"type":"object","properties":{"url":{"type":"string","minLength":1,"maxLength":2048}},"required":["url"],"additionalProperties":false}),
+            output_schema.clone(),
+        ),
+        (
+            "workspace-list",
+            "List every run file with its size and the workspace revision.",
+            json!({"type":"object","properties":{},"required":[],"additionalProperties":false}),
+            list_output,
+        ),
+        (
+            "workspace-append",
+            "Append text to a run file (created if absent) at the given workspace revision.",
+            json!({"type":"object","properties":{"name":name,"revision":revision,"content":content},"required":["name","revision","content"],"additionalProperties":false}),
+            output_schema.clone(),
+        ),
+        (
+            "workspace-search",
+            "Find lines of run files containing an exact substring; returns file, line number and text.",
+            json!({"type":"object","properties":{"pattern":{"type":"string","minLength":1,"maxLength":256}},"required":["pattern"],"additionalProperties":false}),
+            search_output,
+        ),
+        (
+            "workspace-delete",
+            "Delete a run file at the given workspace revision.",
+            json!({"type":"object","properties":{"name":name,"revision":revision},"required":["name","revision"],"additionalProperties":false}),
+            output_schema.clone(),
+        ),
+        (
+            "https-post-json",
+            "POST a JSON object (given as text) to an HTTPS URL on an allowed host; returns the status and body.",
+            json!({"type":"object","properties":{"url":{"type":"string","minLength":1,"maxLength":2048},"body":{"type":"string","minLength":2,"maxLength":4096}},"required":["url","body"],"additionalProperties":false}),
+            post_output,
         ),
     ];
     let schema = |bytes: String| json!({"hash":Hash::of(bytes.as_bytes()),"bytes":bytes});
-    let mut tools: Vec<_> = specifications.iter().map(|(name,input)| json!({"name":name,"path":format!("/{name}"),"hash":entry(name)["executable"],"description":name,"input_schema":schema(input.to_string()),"output_schema":schema(output_schema.clone()),"input_bytes":8192,"output_bytes":32768,"timeout_ms":30000})).collect();
+    let mut tools: Vec<_> = specifications.iter().map(|(name,description,input,output)| json!({"name":name,"path":format!("/{name}"),"hash":entry(name)["executable"],"description":description,"input_schema":schema(input.to_string()),"output_schema":schema(output.clone()),"input_bytes":8192,"output_bytes":32768,"timeout_ms":30000})).collect();
     // Commands borrowed from pinned images at packaging time: each is an argv
     // tool whose executable the package already hashes under `programs`.
     let commands: Vec<crate::starter_package::PackagedCommand> = match package.get("commands") {
@@ -210,14 +283,14 @@ pub fn run(plan: &Path, root: &Path) -> Result<u8> {
         let description = crate::tool_commands::description_with_params(&packaged.command);
         tools.push(json!({"name":packaged.command.name,"path":packaged.alias,"hash":hash,"description":description,"input_schema":schema(input),"output_schema":schema(output),"input_bytes":8192,"output_bytes":8192,"timeout_ms":30000,"argv":{"args":packaged.command.args,"stdin":packaged.command.stdin}}));
     }
-    ensure!(tools.len() <= 16, "at most 16 borrowed tools per worker");
+    ensure!(tools.len() <= 24, "at most 24 borrowed tools per worker");
     let mut template_json = json!({"contract":"celln.json-tools/v1","task":"","system":"Use the borrowed tools when requested. Read files with workspace-read rather than relying on remembered content. Keep replies brief.","url":endpoint,"model":model,"tools":tools,"max_turns":3,"max_calls":1,"require_tool_call":false});
     if connection.is_some_and(|c| c.allow_insecure) {
         template_json["allow_insecure"] = json!(true);
     }
     let template = pilot::turn_worker::Template::new(serde_json::from_value(template_json)?)?;
     let profile = serde_json::to_vec(
-        &json!({"apiVersion":"celln.parent-model-profile/v1","protocol":connection.map(|c| c.protocol).unwrap_or_default(),"allowInsecure":connection.is_some_and(|c| c.allow_insecure),"principal":plan.principal,"requestBinding":worker.configuration_binding(ConfigurationRole::Worker).map_err(anyhow::Error::msg)?,"templateBinding":template.binding(),"credentialFile":plan.credential_file,"url":template.policy().url,"model":template.policy().model,"maxRequests":3,"maxOutputTokens":512,"maxTotalOutputTokens":1536,"workspace":{"read":true,"write":true,"maxOperations":4,"maxFiles":8,"maxFileBytes":4096,"maxTotalBytes":16384},"fetch":{"allowHosts":["example.com"],"maxRequests":4,"maxResponseBytes":4096,"timeoutMs":10000}}),
+        &json!({"apiVersion":"celln.parent-model-profile/v1","protocol":connection.map(|c| c.protocol).unwrap_or_default(),"allowInsecure":connection.is_some_and(|c| c.allow_insecure),"principal":plan.principal,"requestBinding":worker.configuration_binding(ConfigurationRole::Worker).map_err(anyhow::Error::msg)?,"templateBinding":template.binding(),"credentialFile":plan.credential_file,"url":template.policy().url,"model":template.policy().model,"maxRequests":3,"maxOutputTokens":512,"maxTotalOutputTokens":1536,"workspace":{"read":true,"write":true,"maxOperations":8,"maxFiles":8,"maxFileBytes":4096,"maxTotalBytes":16384},"fetch":{"allowHosts":hosts,"maxRequests":4,"maxResponseBytes":4096,"timeoutMs":10000},"post":{"allowHosts":hosts,"maxRequests":4,"maxBodyBytes":4096,"maxResponseBytes":4096,"timeoutMs":10000}}),
     )?;
     let profile_hash = Hash::of(&profile);
     let mut catalogue_tools = Vec::new();
@@ -231,15 +304,17 @@ pub fn run(plan: &Path, root: &Path) -> Result<u8> {
         }
         let bundle = entry(&tool.name);
         let mut limits = json!({"timeoutMillis":30000,"memoryBytes":268435456u64,"argumentBytes":8192,"outputBytes":32768,"workspace":"none","effects":"none"});
-        if tool.name == "https-fetch" {
+        if tool.name == "https-fetch" || tool.name == "https-post-json" {
             limits["effects"] = json!("external-side-effects");
-            limits["https"] = json!({"allowHosts":["example.com"],"maxRequests":4,"maxResponseBytes":4096,"timeoutMillis":10000});
+            limits["https"] = json!({"allowHosts":hosts,"maxRequests":4,"maxResponseBytes":4096,"timeoutMillis":10000});
         } else {
-            let write = tool.name == "workspace-write";
-            if write {
+            // The operation names what the broker will do; changing run data
+            // is an effect the operator approves, reading is not.
+            let operation = tool.name.strip_prefix("workspace-").unwrap_or(&tool.name);
+            if matches!(operation, "write" | "append" | "delete") {
                 limits["effects"] = json!("external-side-effects");
             }
-            limits["artifacts"] = json!({"operation":if write {"write"} else {"read"},"maxOperations":4,"maxFiles":8,"maxFileBytes":4096,"maxTotalBytes":16384});
+            limits["artifacts"] = json!({"operation":operation,"maxOperations":8,"maxFiles":8,"maxFileBytes":4096,"maxTotalBytes":16384});
         }
         catalogue_tools.push(json!({"name":tool.name,"spec":{"revision":"v1","description":tool.description,"supportOwner":"native-starter-operator","publisherKey":bundle["publisher"],"executable":{"hash":bundle["executable"]},"closure":{"hash":bundle["closure"]},"entryPoint":tool.path,"invocationABI":"celln.json-stdio/v1","argumentsSchema":{"hash":tool.input_schema.hash},"resultSchema":{"hash":tool.output_schema.hash},"platform":"linux/amd64","lane":"tool","limits":limits}}));
     }
@@ -263,7 +338,7 @@ pub fn run(plan: &Path, root: &Path) -> Result<u8> {
         write_new(&path, &profile)?;
     }
     fs::File::open(profiles)?.sync_all()?;
-    let mut complete = json!({"apiVersion":"celln.native-starter-configured/v1","packageHash":plan.package_hash,"catalogueHash":Hash::of(&catalogue_bytes),"nativeTemplateHash":Hash::of(&native_bytes),"principal":plan.principal,"modelProfile":profile_hash,"model":{"provider":"deepseek","model":"deepseek-chat"},"hostLimits":{"leaseSeconds":limits.lease_seconds,"maxTurns":limits.max_turns,"maxModelRequests":limits.max_model_requests,"maxOutputTokens":limits.max_output_tokens},"executionAuthorized":false,"readiness":"not_established"});
+    let mut complete = json!({"apiVersion":"celln.native-starter-configured/v1","packageHash":plan.package_hash,"catalogueHash":Hash::of(&catalogue_bytes),"nativeTemplateHash":Hash::of(&native_bytes),"principal":plan.principal,"modelProfile":profile_hash,"model":{"provider":"deepseek","model":"deepseek-chat"},"hostLimits":{"leaseSeconds":limits.lease_seconds,"maxTurns":limits.max_turns,"maxModelRequests":limits.max_model_requests,"maxOutputTokens":limits.max_output_tokens},"httpsHosts":hosts,"executionAuthorized":false,"readiness":"not_established"});
     if let Some(c) = connection {
         complete["model"] = json!({"provider":c.provider,"protocol":c.protocol,"model":c.model,"baseURL":c.endpoint,"credentialProfile":c.credential_profile,"allowInsecure":c.allow_insecure});
     }

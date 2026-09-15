@@ -52,9 +52,10 @@ Two ways to use it:
   command's static executable from the pinned image, lends it inside the
   signed worker closure, and records the image digest as the tool's source, so
   a Sympozium fleet can offer grep, sed, awk, sort, jq and friends to every
-  namespace, each traceable to the layer it came from. The workspace and HTTPS
-  tools stay Celln's own, because they are the only way a cell touches files
-  or the network.
+  namespace, each traceable to the layer it came from. The workspace tools
+  (read, write, list, append, search, delete) and the HTTPS tools (fetch,
+  post JSON) stay Celln's own, because they are the only way a cell touches
+  files or the network: each goes through a host broker with its own grant.
 
 ## How is this different?
 

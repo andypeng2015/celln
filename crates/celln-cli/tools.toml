@@ -120,6 +120,12 @@ commands = [
     { name = "text", type = "string", required = true, max = 4096 } ] },
   { name = "date", exec = "/bin/busybox", args = ["-u", "{format}"], description = "The current UTC date and time, optionally in a strftime format such as +%Y-%m-%d.", params = [
     { name = "format", type = "string", max = 64, description = "strftime format starting with +" } ] },
+  { name = "tr", exec = "/bin/busybox", args = ["{delete?-d}", "{squeeze?-s}", "{from}", "{to}"], stdin = "text", description = "Translate characters in text from one set to another, or delete (delete=true) or squeeze repeats (squeeze=true) of the first set.", params = [
+    { name = "from", type = "string", required = true, max = 256 },
+    { name = "to", type = "string", max = 256 },
+    { name = "delete", type = "boolean" },
+    { name = "squeeze", type = "boolean" },
+    { name = "text", type = "string", required = true, max = 4096 } ] },
 ]
 
 [[image]]

@@ -160,6 +160,10 @@ const LIVE_SIGNAL_PORT: u16 = 0x3f0;
 /// This is not a NIC: the guest gets no packet interface and no socket API.
 // 0x2f8 is COM2 and Linux probes it; use an otherwise-unassigned range.
 pub const PILOT_FETCH_TX: u16 = 0x500;
+/// Largest broker request the host buffers from a cell. The model request
+/// carries every tool schema and the conversation (32 KiB in the guest and
+/// broker); the workspace and fetch tools bound themselves lower.
+const MAX_FETCH_REQUEST_BYTES: usize = 32768;
 pub const PILOT_FETCH_CALL: u16 = 0x501;
 pub const PILOT_FETCH_RX: u16 = 0x502;
 pub const PILOT_FETCH_STATUS: u16 = 0x503;
@@ -1537,7 +1541,7 @@ impl LinuxCell {
                                 // cannot make the host buffer an unbounded URL.
                                 // Retain one overflow byte so a truncated,
                                 // valid JSON prefix cannot execute as a request.
-                                let take = 8193usize
+                                let take = (MAX_FETCH_REQUEST_BYTES + 1)
                                     .saturating_sub(self.fetch_request.len())
                                     .min(data.len());
                                 self.fetch_request.extend_from_slice(&data[..take]);

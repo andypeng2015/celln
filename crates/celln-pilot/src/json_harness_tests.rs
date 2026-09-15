@@ -361,11 +361,26 @@ fn final_model_turn_cannot_start_side_effects_without_a_result_turn() {
 
 #[test]
 fn host_validation_rejects_initial_envelope_overflow_before_execution() {
-    let names: Vec<_> = (0..16).map(|n| format!("tool{n}")).collect();
+    let names: Vec<_> = (0..24).map(|n| format!("tool{n}")).collect();
     let refs: Vec<_> = names.iter().map(String::as_str).collect();
     let mut cfg = config(&refs);
+    // Two dozen tools with the longest allowed descriptions and wide (but
+    // valid) argument schemas overflow the model wire budget.
+    let wide = {
+        let properties: serde_json::Map<String, Value> = (0..32)
+            .map(|i| {
+                (
+                    format!("field{i}{}", "y".repeat(56)),
+                    json!({"type":"string","minLength":0,"maxLength":64}),
+                )
+            })
+            .collect();
+        json!({"type":"object","properties":properties,"required":[],"additionalProperties":false})
+            .to_string()
+    };
     for tool in &mut cfg.tools {
         tool.description = "x".repeat(512);
+        tool.input_schema = schema(&wide);
     }
     assert!(validate(&cfg).unwrap_err().to_string().contains("envelope"));
     assert!(run(
@@ -375,6 +390,12 @@ fn host_validation_rejects_initial_envelope_overflow_before_execution() {
         |_| {}
     )
     .is_err());
+    // The same two dozen tools, plainly described, fit.
+    let mut cfg = config(&refs);
+    for tool in &mut cfg.tools {
+        tool.description = "x".repeat(160);
+    }
+    assert!(validate(&cfg).is_ok());
 }
 
 // A borrowed command: validated JSON becomes argv/stdin through the fixed

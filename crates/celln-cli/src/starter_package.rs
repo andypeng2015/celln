@@ -22,7 +22,28 @@ const PROGRAMS: &[(&str, &str)] = &[
     ("/workspace-read", "celln-workspace-read"),
     ("/workspace-write", "celln-workspace-write"),
     ("/https-fetch", "celln-https-fetch"),
+    ("/workspace-list", "celln-workspace-list"),
+    ("/workspace-append", "celln-workspace-append"),
+    ("/workspace-search", "celln-workspace-search"),
+    ("/workspace-delete", "celln-workspace-delete"),
+    ("/https-post-json", "celln-https-post-json"),
 ];
+
+/// The brokered starter tools: each is its own bundle and every one is also a
+/// member of the worker closure. Order is the bundle order in package.json.
+pub(crate) const STARTER_TOOLS: [&str; 8] = [
+    "workspace-read",
+    "workspace-write",
+    "https-fetch",
+    "workspace-list",
+    "workspace-append",
+    "workspace-search",
+    "workspace-delete",
+    "https-post-json",
+];
+
+/// Worker tools beyond the brokered ones: the harness admits 24 per template.
+pub(crate) const MAX_BORROWED_COMMANDS: usize = 24 - STARTER_TOOLS.len();
 
 pub(crate) fn regular(path: &Path, bound: usize) -> Result<Vec<u8>> {
     let file = fs::OpenOptions::new()
@@ -159,8 +180,9 @@ fn borrowed_commands(tool_images: &[String], root: &Path, o: &crate::out::Out) -
         }
     }
     ensure!(
-        commands.len() <= 13,
-        "at most 13 borrowed commands fit beside the three starter tools"
+        commands.len() <= MAX_BORROWED_COMMANDS,
+        "at most {MAX_BORROWED_COMMANDS} borrowed commands fit beside the {} starter tools",
+        STARTER_TOOLS.len()
     );
     Ok((programs, commands))
 }
@@ -249,13 +271,12 @@ pub(crate) fn prepare(
     for (alias, bytes) in borrowed {
         programs.insert(alias.as_str(), bytes.clone());
     }
-    let mut worker_aliases = vec![
-        "/worker",
-        "/pilot-fetch",
-        "/workspace-read",
-        "/workspace-write",
-        "/https-fetch",
-    ];
+    let starter_aliases: Vec<String> = STARTER_TOOLS
+        .iter()
+        .map(|name| format!("/{name}"))
+        .collect();
+    let mut worker_aliases = vec!["/worker", "/pilot-fetch"];
+    worker_aliases.extend(starter_aliases.iter().map(String::as_str));
     for alias in borrowed.keys() {
         if !worker_aliases.contains(&alias.as_str()) {
             worker_aliases.push(alias.as_str());
@@ -286,13 +307,11 @@ pub(crate) fn prepare(
     }
     publish(&output.join("kernel"), &kernel_bytes)?;
     let mut bundles = Vec::new();
-    for (name, aliases) in [
-        ("parent", vec!["/parent"]),
-        ("worker", worker_aliases),
-        ("workspace-read", vec!["/workspace-read", "/pilot-fetch"]),
-        ("workspace-write", vec!["/workspace-write", "/pilot-fetch"]),
-        ("https-fetch", vec!["/https-fetch", "/pilot-fetch"]),
-    ] {
+    let mut plan = vec![("parent", vec!["/parent"]), ("worker", worker_aliases)];
+    for (name, alias) in STARTER_TOOLS.iter().zip(&starter_aliases) {
+        plan.push((name, vec![alias.as_str(), "/pilot-fetch"]));
+    }
+    for (name, aliases) in plan {
         bundles.push(bundle(
             output,
             staging.path(),
@@ -379,8 +398,8 @@ fn bundle(
         aliases.iter().skip(1).map(|s| (*s).to_owned()).collect();
     // Each starter executable invokes pilot-fetch; record that edge even when
     // all tools are also transitive dependencies of the worker entrypoint.
-    for alias in ["/workspace-read", "/workspace-write", "/https-fetch"] {
-        if let Some(member) = members.get_mut(alias) {
+    for name in STARTER_TOOLS {
+        if let Some(member) = members.get_mut(&format!("/{name}")) {
             member.dependencies.insert("/pilot-fetch".to_owned());
         }
     }
@@ -457,7 +476,7 @@ mod tests {
     use super::*;
     #[test]
     #[ignore = "explicit cold packaging test: requires kernel, guest binaries, gcc/cpio/mke2fs; no KVM or model"]
-    fn packages_five_signed_bundles_without_admission() {
+    fn packages_ten_signed_bundles_without_admission() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .canonicalize()
@@ -481,7 +500,7 @@ mod tests {
         .unwrap();
         assert_eq!(report["admitted"], false);
         assert_eq!(report["executionAuthorized"], false);
-        assert_eq!(report["bundles"].as_array().unwrap().len(), 5);
+        assert_eq!(report["bundles"].as_array().unwrap().len(), 10);
         for entry in report["bundles"].as_array().unwrap() {
             let bundle = output.join(entry["name"].as_str().unwrap());
             let raw = fs::read(bundle.join("signed-closure.json")).unwrap();
@@ -502,8 +521,8 @@ mod tests {
                     Hash::of(&fs::read(bundle.join(file)).unwrap()).0
                 );
             }
-            for alias in ["/workspace-read", "/workspace-write", "/https-fetch"] {
-                if let Some(member) = signed.closure.members.get(alias) {
+            for alias in STARTER_TOOLS.map(|name| format!("/{name}")) {
+                if let Some(member) = signed.closure.members.get(&alias) {
                     assert!(member.dependencies.contains("/pilot-fetch"));
                     assert!(signed.closure.members.contains_key("/pilot-fetch"));
                 }
