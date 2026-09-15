@@ -13,6 +13,11 @@ const NAMES: &[&str] = &[
     "workspace-read",
     "workspace-write",
     "https-fetch",
+    "workspace-list",
+    "workspace-append",
+    "workspace-search",
+    "workspace-delete",
+    "https-post-json",
 ];
 
 pub(crate) struct Candidate {
@@ -46,7 +51,7 @@ pub(crate) fn verified(package: &Path, expected: &str, root: &Path) -> Result<Ve
         .context("package bundles required")?;
     ensure!(
         entries.len() == NAMES.len(),
-        "exact five-bundle starter package required"
+        "exact ten-bundle starter package required"
     );
     let kernel = regular(&package.join("kernel"), 64 << 20)?;
     ensure!(
@@ -207,7 +212,7 @@ mod tests {
         assert_eq!(run(&package, &expected, &root).unwrap(), 0);
         let policy: Value =
             serde_json::from_slice(&fs::read(root.join("trusted-motes.json")).unwrap()).unwrap();
-        assert_eq!(policy["bundles"].as_array().unwrap().len(), 5);
+        assert_eq!(policy["bundles"].as_array().unwrap().len(), 10);
         for entry in report["bundles"].as_array().unwrap() {
             assert!(policy["bundles"]
                 .as_array()

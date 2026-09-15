@@ -90,7 +90,7 @@ enum Cmd {
         #[arg(long)]
         package_hash: String,
     },
-    /// Cold-package the native parent/worker and three starter tools; grants no authority.
+    /// Cold-package the native parent/worker and eight starter tools; grants no authority.
     StarterPackage {
         #[arg(long)]
         runtime_dir: PathBuf,

@@ -207,7 +207,7 @@ fn compile(config: &Config) -> Result<Vec<CheckedTool<'_>>> {
         "invalid model selection"
     );
     ensure!(
-        (1..=6).contains(&config.max_turns) && config.max_calls <= 16 && config.tools.len() <= 16,
+        (1..=6).contains(&config.max_turns) && config.max_calls <= 16 && config.tools.len() <= 24,
         "turn/call/tool limit exceeds contract"
     );
     let mut names = BTreeSet::new();

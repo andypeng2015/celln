@@ -205,7 +205,7 @@ fn validate_chat(body: &serde_json::Value, grant: &JsonPostGrant) -> Result<u64,
         })
         || chat.tools.as_ref().is_some_and(|tools| {
             tools.is_empty()
-                || tools.len() > 16
+                || tools.len() > 24
                 || tools.iter().any(|t| {
                     t.kind != "function"
                         || t.function.name.is_empty()
@@ -405,7 +405,9 @@ impl HttpBroker {
 
     pub(super) fn post_json(&mut self, raw: &str) -> Result<Vec<u8>, FetchDenied> {
         let request = parse(raw)?;
-        let grant = self.grant_for(&request)?.clone();
+        let Ok(grant) = self.grant_for(&request).cloned() else {
+            return self.post_plain(request);
+        };
         let output_tokens = validate_chat(&request.body, &grant)?;
         let used = if self.policy.get.is_some() {
             self.used - self.get_used
@@ -502,12 +504,147 @@ impl HttpBroker {
         }
         Ok(normalized)
     }
+
+    /// A credential-free JSON POST under the starter post grant: exact host,
+    /// bounded body and response, no headers beyond the content type, no
+    /// redirect. The HTTP status is data for the tool, not a refusal, so a
+    /// receiver's 4xx reaches the model verbatim.
+    fn post_plain(&mut self, request: Request) -> Result<Vec<u8>, FetchDenied> {
+        let grant = self
+            .policy
+            .post
+            .clone()
+            .ok_or_else(|| refused("JSON POST endpoint not granted"))?;
+        let host = super::url_host(&request.url).ok_or(FetchDenied::Authority)?;
+        if !grant
+            .allow_hosts
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(&host))
+        {
+            return Err(FetchDenied::Host(host));
+        }
+        if self.post_used >= grant.max_requests {
+            return Err(FetchDenied::Budget);
+        }
+        let body_bytes =
+            serde_json::to_vec(&request.body).map_err(|_| refused("request staging failed"))?;
+        if body_bytes.len() > grant.max_body_bytes {
+            return Err(refused("POST body exceeds byte budget"));
+        }
+        let authorized = self.authorize(&request.url)?;
+        self.post_used += 1;
+        let mut body =
+            tempfile::NamedTempFile::new().map_err(|_| refused("request staging failed"))?;
+        body.write_all(&body_bytes)
+            .map_err(|_| refused("request staging failed"))?;
+        let response_headers =
+            tempfile::NamedTempFile::new().map_err(|_| refused("response staging failed"))?;
+        let mut command = Command::new("curl");
+        command
+            .args([
+                "--disable",
+                "--silent",
+                "--show-error",
+                "--globoff",
+                "--noproxy",
+                "*",
+                "--proto",
+                if self.policy.allow_insecure {
+                    "=http,https"
+                } else {
+                    "=https"
+                },
+                "--max-redirs",
+                "0",
+                "--request",
+                "POST",
+                "--header",
+                "Content-Type: application/json",
+            ])
+            .arg("--data-binary")
+            .arg(format!("@{}", body.path().display()))
+            .arg("--max-time")
+            .arg(grant.timeout.as_secs().max(1).to_string())
+            .arg("--max-filesize")
+            .arg(grant.max_response_bytes.to_string());
+        if self.policy.allow_insecure && authorized.scheme == "https" {
+            command.arg("--insecure");
+        }
+        command
+            .arg("--resolve")
+            .arg(format!(
+                "{}:{}:{}",
+                authorized.host, authorized.port, authorized.ip
+            ))
+            .arg("--dump-header")
+            .arg(response_headers.path())
+            .arg("--url")
+            .arg(&request.url);
+        let out = celln_control::process::output_with_timeout(&mut command, Some(grant.timeout))
+            .map_err(|_| refused("JSON POST interrupted or unavailable"))?;
+        if !out.status.success() {
+            return Err(refused("JSON POST failed"));
+        }
+        if out.stdout.len() > grant.max_response_bytes {
+            return Err(refused("response exceeded byte budget"));
+        }
+        let headers = std::fs::read_to_string(response_headers.path())
+            .map_err(|_| refused("invalid response headers"))?;
+        let (status, _) = response_status_and_location(&headers)
+            .ok_or_else(|| refused("missing HTTP response headers"))?;
+        let content = String::from_utf8_lossy(&out.stdout).into_owned();
+        serde_json::to_vec(&serde_json::json!({"status":status,"content":content}))
+            .map_err(|_| refused("response encoding failed"))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::egress::HttpPolicy;
+    use crate::egress::{HttpPolicy, PostGrant};
+
+    #[test]
+    fn plain_posts_need_their_own_grant_host_and_budget_and_never_a_credential() {
+        use serde_json::json;
+        let wire = |url: &str| {
+            json!({"apiVersion":"celln.fetch/v1","method":"POST","url":url,"body":{"event":"done"}})
+                .to_string()
+        };
+        // No post grant: the model grant list does not cover arbitrary URLs.
+        let mut none = HttpBroker::new(HttpPolicy::new(vec!["hooks.example".into()]));
+        assert_eq!(
+            none.fetch(&wire("https://hooks.example/in")).unwrap_err(),
+            refused("JSON POST endpoint not granted")
+        );
+        let mut policy = HttpPolicy::new(vec!["hooks.example".into()]);
+        policy.post = Some(PostGrant {
+            allow_hosts: vec!["hooks.example".into()],
+            max_requests: 1,
+            max_body_bytes: 8,
+            max_response_bytes: 4096,
+            timeout: std::time::Duration::from_secs(1),
+        });
+        let mut broker = HttpBroker::new(policy);
+        // The grant names hosts exactly; the model host is not a POST host.
+        assert!(matches!(
+            broker.fetch(&wire("https://other.example/in")).unwrap_err(),
+            FetchDenied::Host(_)
+        ));
+        // A body beyond the grant is refused before any network use.
+        assert_eq!(
+            broker.fetch(&wire("https://hooks.example/in")).unwrap_err(),
+            refused("POST body exceeds byte budget")
+        );
+        assert_eq!(broker.post_used, 0);
+        // Not an object, not a POST, wrong version: parse refuses.
+        for raw in [
+            json!({"apiVersion":"celln.fetch/v1","method":"POST","url":"https://hooks.example/in","body":[1]}).to_string(),
+            json!({"apiVersion":"celln.fetch/v1","method":"PUT","url":"https://hooks.example/in","body":{}}).to_string(),
+            json!({"apiVersion":"celln.fetch/v2","method":"POST","url":"https://hooks.example/in","body":{}}).to_string(),
+        ] {
+            assert!(broker.fetch(&raw).is_err());
+        }
+    }
 
     #[test]
     fn anthropic_round_trip_preserves_tool_ids_results_and_usage() {

@@ -34,6 +34,41 @@ struct Profile {
     workspace: Option<WorkspaceProfile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fetch: Option<FetchProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    post: Option<PostProfile>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PostProfile {
+    allow_hosts: Vec<String>,
+    max_requests: usize,
+    max_body_bytes: usize,
+    max_response_bytes: usize,
+    timeout_ms: u64,
+}
+
+/// Starter tools that read run data and those that change it. A profile's
+/// read or write flag must agree with the tools the template selects.
+const WORKSPACE_READERS: [&str; 3] = ["workspace-read", "workspace-list", "workspace-search"];
+const WORKSPACE_WRITERS: [&str; 3] = ["workspace-write", "workspace-append", "workspace-delete"];
+
+fn valid_hosts(hosts: &[String]) -> bool {
+    !hosts.is_empty()
+        && hosts.len() <= 16
+        && hosts.iter().all(|host| {
+            host.len() <= 253
+                && host.contains('.')
+                && host.split('.').all(|label| {
+                    !label.is_empty()
+                        && label.len() <= 63
+                        && !label.starts_with('-')
+                        && !label.ends_with('-')
+                        && label
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                })
+        })
 }
 
 #[derive(Deserialize, Serialize)]
@@ -114,21 +149,18 @@ impl ChildBrokers {
             workspace: None,
         };
         let admitted = issuer.read_profile()?;
-        if admitted.fetch.is_some()
-            && !template
-                .policy()
-                .tools
-                .iter()
-                .any(|t| t.name == "https-fetch")
-        {
+        let has_tool = |name: &str| template.policy().tools.iter().any(|t| t.name == name);
+        if admitted.fetch.is_some() && !has_tool("https-fetch") {
             return Err("fetch profile lacks explicitly selected starter tool".into());
+        }
+        if admitted.post.is_some() && !has_tool("https-post-json") {
+            return Err("post profile lacks explicitly selected starter tool".into());
         }
         if let Some(workspace) = admitted.workspace {
             // The entire profile is content-hash pinned to the parent permit.
             // Tool selection still requires independent upstream admission.
-            let has_tool = |name: &str| template.policy().tools.iter().any(|t| t.name == name);
-            if workspace.read != has_tool("workspace-read")
-                || workspace.write != has_tool("workspace-write")
+            if workspace.read != WORKSPACE_READERS.iter().any(|name| has_tool(name))
+                || workspace.write != WORKSPACE_WRITERS.iter().any(|name| has_tool(name))
                 || (!workspace.read && !workspace.write)
                 || !(1..=64).contains(&workspace.max_operations)
             {
@@ -191,23 +223,19 @@ impl ChildBrokers {
             if !(1..=16).contains(&fetch.max_requests)
                 || !(1..=65536).contains(&fetch.max_response_bytes)
                 || !(1..=30000).contains(&fetch.timeout_ms)
-                || fetch.allow_hosts.is_empty()
-                || fetch.allow_hosts.len() > 16
-                || fetch.allow_hosts.iter().any(|host| {
-                    host.len() > 253
-                        || !host.contains('.')
-                        || host.split('.').any(|label| {
-                            label.is_empty()
-                                || label.len() > 63
-                                || label.starts_with('-')
-                                || label.ends_with('-')
-                                || !label.bytes().all(|b| {
-                                    b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'
-                                })
-                        })
-                })
+                || !valid_hosts(&fetch.allow_hosts)
             {
                 return Err("invalid bounded HTTPS starter profile".into());
+            }
+        }
+        if let Some(post) = &profile.post {
+            if !(1..=16).contains(&post.max_requests)
+                || !(1..=8192).contains(&post.max_body_bytes)
+                || !(1..=65536).contains(&post.max_response_bytes)
+                || !(1..=30000).contains(&post.timeout_ms)
+                || !valid_hosts(&post.allow_hosts)
+            {
+                return Err("invalid bounded JSON POST starter profile".into());
             }
         }
         Ok(profile)
@@ -268,6 +296,16 @@ impl ChildBrokers {
         };
         policy.allow_hosts.extend(get.allow_hosts.iter().cloned());
         policy.get = Some(get);
+        if let Some(post) = profile.post {
+            policy.allow_hosts.extend(post.allow_hosts.iter().cloned());
+            policy.post = Some(warden::egress::PostGrant {
+                allow_hosts: post.allow_hosts,
+                max_requests: post.max_requests,
+                max_body_bytes: post.max_body_bytes,
+                max_response_bytes: post.max_response_bytes,
+                timeout: std::time::Duration::from_millis(post.timeout_ms).min(turn.limits.timeout),
+            });
+        }
         policy.json_posts.push(warden::egress::JsonPostGrant {
             protocol: profile.protocol,
             url: profile.url,
@@ -349,6 +387,7 @@ mod tests {
             allow_insecure: false,
             workspace: None,
             fetch: None,
+            post: None,
         };
         let bytes = serde_json::to_vec(&profile).unwrap();
         let hash = Hash::of(&bytes);
@@ -403,6 +442,104 @@ mod tests {
             lease.confirm_child_destroyed(&turn.child).unwrap();
         }
         assert_eq!(issuer.claimed.len(), 2);
+    }
+    #[test]
+    fn workspace_and_post_profiles_must_match_selected_starter_tools() {
+        let (root, issuer, _lease, path) = fixture();
+        let request = super::super::parent_tests::request();
+        let empty =
+            r#"{"type":"object","properties":{},"required":[],"additionalProperties":false}"#;
+        let schema = serde_json::json!({"hash":Hash::of(empty.as_bytes()).0,"bytes":empty});
+        let tool = |name: &str| {
+            serde_json::json!({"name":name,"path":format!("/{name}"),"hash":format!("blake3:{}", "a".repeat(64)),"description":name,
+                "input_schema":schema,"output_schema":schema,
+                "input_bytes":1024,"output_bytes":1024,"timeout_ms":1000})
+        };
+        let attempt = |tools: Vec<serde_json::Value>,
+                       workspace: Option<WorkspaceProfile>,
+                       post: Option<PostProfile>| {
+            let template = Template::new(
+                serde_json::from_value(serde_json::json!({
+                    "contract":"celln.json-tools/v1","task":"","system":"host persona",
+                    "url":"https://api.deepseek.com/chat/completions","model":"deepseek-chat",
+                    "tools":tools,"max_turns":1,"max_calls":0
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let mut profile: Profile =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            profile.template_binding = template.binding().clone();
+            profile.workspace = workspace;
+            profile.post = post;
+            let bytes = serde_json::to_vec(&profile).unwrap();
+            let hash = Hash::of(&bytes);
+            let mut binding = issuer.binding.clone();
+            binding.worker_configuration = worker_binding(&request, &template, &hash).unwrap();
+            std::fs::write(
+                root.path()
+                    .join("trusted-parent-models")
+                    .join(format!("{}.json", &hash.0[7..])),
+                &bytes,
+            )
+            .unwrap();
+            ChildBrokers::new(root.path(), hash, binding, &request, &template).map(|_| ())
+        };
+        let workspace = |read: bool, write: bool| {
+            Some(WorkspaceProfile {
+                read,
+                write,
+                max_operations: 4,
+                max_files: 8,
+                max_file_bytes: 4096,
+                max_total_bytes: 16384,
+            })
+        };
+        let post = || {
+            Some(PostProfile {
+                allow_hosts: vec!["hooks.example".into()],
+                max_requests: 4,
+                max_body_bytes: 4096,
+                max_response_bytes: 4096,
+                timeout_ms: 10000,
+            })
+        };
+        // list and search are readers; append and delete are writers.
+        assert!(attempt(
+            vec![tool("workspace-list"), tool("workspace-search")],
+            workspace(true, false),
+            None
+        )
+        .is_ok());
+        assert!(attempt(
+            vec![tool("workspace-append"), tool("workspace-delete")],
+            workspace(false, true),
+            None
+        )
+        .is_ok());
+        assert!(attempt(vec![tool("workspace-list")], workspace(true, true), None).is_err());
+        assert!(attempt(vec![tool("workspace-append")], workspace(true, true), None).is_err());
+        // A post profile needs the tool, and the tool alone grants nothing.
+        assert!(attempt(vec![tool("https-post-json")], None, post()).is_ok());
+        assert!(attempt(vec![], None, post()).is_err());
+        assert!(attempt(
+            vec![tool("https-post-json")],
+            None,
+            Some(PostProfile {
+                allow_hosts: vec!["Hooks.Example".into()],
+                ..post().unwrap()
+            })
+        )
+        .is_err());
+        assert!(attempt(
+            vec![tool("https-post-json")],
+            None,
+            Some(PostProfile {
+                max_body_bytes: 0,
+                ..post().unwrap()
+            })
+        )
+        .is_err());
     }
     #[test]
     fn live_profile_revocation_consumes_claim_without_retry_or_refund() {
