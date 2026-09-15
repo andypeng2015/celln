@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.5.19](https://github.com/sympozium-ai/celln/compare/v0.5.18...v0.5.19) (2026-09-15)
+
+
+### Features
+
+* **harness:** 32 KiB model request wire budget for two dozen tools ([0063841](https://github.com/sympozium-ai/celln/commit/0063841dfcaf6e526213bc5309bb7ae6dce4c5a3))
+* **starter:** workspace list/append/search/delete and credential-free JSON POST tools ([4dc50b9](https://github.com/sympozium-ai/celln/commit/4dc50b91974f6f042d1fa5f9b929bd31d83c30c9))
+* **starter:** workspace list/append/search/delete and credential-free JSON POST tools ([cad57b3](https://github.com/sympozium-ai/celln/commit/cad57b363d10ecdd587067016597c6a3cf2706cf))
+
+
+### Bug Fixes
+
+* **vmm:** buffer 32 KiB broker requests from a cell ([1ba40eb](https://github.com/sympozium-ai/celln/commit/1ba40ebf488c766cc6aee170c66452fc2b594a85))
+
 ## [0.5.18](https://github.com/sympozium-ai/celln/compare/v0.5.17...v0.5.18) (2026-09-15)
 
 
