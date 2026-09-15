@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.18](https://github.com/sympozium-ai/celln/compare/v0.5.17...v0.5.18) (2026-09-15)
+
+
+### Features
+
+* **tools:** borrow real commands from pinned images as argv tools ([b16db8a](https://github.com/sympozium-ai/celln/commit/b16db8ac628db33c339ecff4464f0b4d5fdf440d))
+* **tools:** borrow real commands from pinned images as argv tools ([4c90df5](https://github.com/sympozium-ai/celln/commit/4c90df5268d23db391f32859c6795738b1992e1b))
+
 ## [0.5.17](https://github.com/sympozium-ai/celln/compare/v0.5.16...v0.5.17) (2026-09-14)
 
 
