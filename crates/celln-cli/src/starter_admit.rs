@@ -180,8 +180,16 @@ mod tests {
         let package = dir.path().join("package");
         let key = dir.path().join("key");
         fs::write(&key, [19u8; 32]).unwrap();
-        let report =
-            crate::starter_package::prepare(&repo, &guest, &kernel, &key, &package).unwrap();
+        let report = crate::starter_package::prepare(
+            &repo,
+            &guest,
+            &kernel,
+            &key,
+            &package,
+            &Default::default(),
+            &[],
+        )
+        .unwrap();
         let expected = Hash::of(&fs::read(package.join("package.json")).unwrap()).0;
         let root = dir.path().join("authority");
         fs::create_dir(&root).unwrap();

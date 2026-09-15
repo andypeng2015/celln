@@ -27,6 +27,7 @@ mod starter_admit;
 mod starter_configure;
 #[cfg(target_os = "linux")]
 mod starter_package;
+mod tool_commands;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -101,6 +102,13 @@ enum Cmd {
         signing_key: PathBuf,
         #[arg(long)]
         output: PathBuf,
+        /// A catalogue image whose `commands` join the worker as borrowed
+        /// tools (repeatable). Each command's static executable is taken from
+        /// the digest-pinned image in this root's image store (pulled once if
+        /// absent) and lent under its own alias; the model calls it through the
+        /// argv binding the catalogue declares.
+        #[arg(long = "tool-image")]
+        tool_images: Vec<String>,
     },
     /// Publish one run's parent authority from an independently authorized local plan; does not launch.
     ParentProvision {
@@ -601,14 +609,31 @@ fn dispatch(cli: &Cli, o: &Out) -> Result<u8> {
             kernel,
             signing_key,
             output,
+            tool_images,
         } => {
             #[cfg(target_os = "linux")]
             {
-                starter_package::run(runtime_dir, guest_dir, kernel, signing_key, output)
+                starter_package::run(
+                    runtime_dir,
+                    guest_dir,
+                    kernel,
+                    signing_key,
+                    output,
+                    tool_images,
+                    &root,
+                    o,
+                )
             }
             #[cfg(not(target_os = "linux"))]
             {
-                let _ = (runtime_dir, guest_dir, kernel, signing_key, output);
+                let _ = (
+                    runtime_dir,
+                    guest_dir,
+                    kernel,
+                    signing_key,
+                    output,
+                    tool_images,
+                );
                 anyhow::bail!("Unsupported: native starter packaging requires Linux")
             }
         }

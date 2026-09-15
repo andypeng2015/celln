@@ -49,6 +49,115 @@ pub struct Tool {
     pub input_bytes: usize,
     pub output_bytes: usize,
     pub timeout_ms: u64,
+    /// `celln.argv/v1`: the tool is an ordinary command-line program borrowed
+    /// from a pinned image. Validated arguments become argv and stdin through
+    /// this fixed binding; stdout and the exit status come back as JSON. No
+    /// shell, no free-form flags, no host paths. Absent means JSON on stdin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argv: Option<Argv>,
+}
+
+/// How a validated JSON argument object becomes a command line. An `args`
+/// entry is a literal, `{field}` (the field's string form; an absent optional
+/// field drops the entry), `{field?FLAG}` (FLAG when the boolean field is
+/// true, else dropped) or `{field:FLAG}` (FLAG followed by the field's value
+/// when present, else nothing). `stdin` names a string field fed to the tool.
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct Argv {
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdin: Option<String>,
+}
+
+/// Longest stdout an argv tool hands back, in bytes; the tool schema subset
+/// bounds strings at this length.
+pub const ARGV_OUTPUT_CHARS: usize = 4096;
+
+/// Result shape every argv tool returns to the model; the packager declares
+/// it as such a tool's output schema.
+pub fn argv_output_schema() -> Value {
+    json!({"type":"object","properties":{"output":{"type":"string","minLength":0,"maxLength":ARGV_OUTPUT_CHARS},"exit":{"type":"integer","minimum":-1,"maximum":255}},"required":["output","exit"],"additionalProperties":false})
+}
+
+/// Builds argv and stdin for one call from already schema-validated arguments.
+pub fn argv_invocation(tool: &Tool, arguments: &[u8]) -> Result<(Vec<String>, Vec<u8>)> {
+    let binding = tool.argv.as_ref().context("tool has no argv binding")?;
+    let input: serde_json::Map<String, Value> = serde_json::from_slice(arguments)?;
+    let text = |field: &str| -> Result<Option<String>> {
+        Ok(match input.get(field) {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(Value::Number(n)) => Some(n.to_string()),
+            Some(Value::Bool(b)) => Some(b.to_string()),
+            Some(_) => bail!("argument {field} is not a scalar"),
+        })
+    };
+    let mut args = Vec::with_capacity(binding.args.len());
+    for entry in &binding.args {
+        match placeholder(entry) {
+            Some((field, Placeholder::Switch(flag))) => {
+                if input.get(field) == Some(&Value::Bool(true)) {
+                    args.push(flag.to_string());
+                }
+            }
+            Some((field, Placeholder::Option(flag))) => {
+                if let Some(value) = text(field)? {
+                    ensure!(!value.contains('\0'), "argument {field} contains NUL");
+                    args.push(flag.to_string());
+                    args.push(value);
+                }
+            }
+            Some((field, Placeholder::Value)) => {
+                if let Some(value) = text(field)? {
+                    ensure!(!value.contains('\0'), "argument {field} contains NUL");
+                    args.push(value);
+                }
+            }
+            None => args.push(entry.clone()),
+        }
+    }
+    let stdin = match &binding.stdin {
+        Some(field) => text(field)?.unwrap_or_default().into_bytes(),
+        None => Vec::new(),
+    };
+    Ok((args, stdin))
+}
+
+enum Placeholder<'a> {
+    Value,
+    Switch(&'a str),
+    Option(&'a str),
+}
+
+/// `{field}`, `{field?FLAG}` or `{field:FLAG}`; anything else is a literal.
+fn placeholder(entry: &str) -> Option<(&str, Placeholder<'_>)> {
+    let inner = entry.strip_prefix('{')?.strip_suffix('}')?;
+    if inner.is_empty() || inner.contains(['{', '}']) {
+        return None;
+    }
+    if let Some((field, flag)) = inner.split_once('?') {
+        return Some((field, Placeholder::Switch(flag)));
+    }
+    if let Some((field, flag)) = inner.split_once(':') {
+        return Some((field, Placeholder::Option(flag)));
+    }
+    Some((inner, Placeholder::Value))
+}
+
+/// What the model sees from an argv tool: bounded UTF-8 stdout and the exit
+/// status. Invalid UTF-8 is replaced rather than failing the turn.
+pub fn argv_output(exit: i32, stdout: &[u8]) -> Vec<u8> {
+    let mut text = String::from_utf8_lossy(stdout).into_owned();
+    let room = ARGV_OUTPUT_CHARS;
+    if text.len() > room {
+        let mut end = room;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    serde_json::to_vec(&json!({"output": text, "exit": exit})).unwrap_or_default()
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -121,6 +230,25 @@ fn compile(config: &Config) -> Result<Vec<CheckedTool<'_>>> {
         let output = ToolSchema::parse(tool.output_schema.bytes.as_bytes(), &Hash(tool.output_schema.hash.clone())).map_err(anyhow::Error::msg)?;
         let parameters: Value = serde_json::from_str(&tool.input_schema.bytes)?;
         ensure!(parameters["type"] == "object", "JSON-tool inputs must use an object schema");
+        if let Some(argv) = &tool.argv {
+            let properties = parameters["properties"].as_object().cloned().unwrap_or_default();
+            ensure!(argv.args.len() <= 32 && argv.args.iter().all(|a| a.len() <= 1024 && !a.contains('\0')), "argv binding exceeds contract");
+            for entry in &argv.args {
+                if let Some((field, shape)) = placeholder(entry) {
+                    let kind = properties.get(field).map(|p| p["type"].clone()).unwrap_or(Value::Null);
+                    ensure!(!kind.is_null(), "argv placeholder {field} is not an input field");
+                    match shape {
+                        Placeholder::Switch(_) => ensure!(kind == "boolean", "argv flag placeholder {field} must be a boolean field"),
+                        _ => ensure!(kind == "string" || kind == "integer" || kind == "number" || kind == "boolean", "argv placeholder {field} must be a scalar field"),
+                    }
+                }
+            }
+            if let Some(field) = &argv.stdin {
+                ensure!(properties.get(field).is_some_and(|p| p["type"] == "string"), "argv stdin field must be a string input field");
+            }
+            let output: Value = serde_json::from_str(&tool.output_schema.bytes)?;
+            ensure!(output == argv_output_schema(), "argv tool output schema must be the argv result shape");
+        }
         let definition = json!({"type":"function","function":{"name":tool.name,"description":tool.description,"parameters":parameters}});
         Ok(CheckedTool { tool, input, output, definition })
     }).collect()

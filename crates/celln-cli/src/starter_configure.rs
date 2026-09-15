@@ -189,7 +189,28 @@ pub fn run(plan: &Path, root: &Path) -> Result<u8> {
         ),
     ];
     let schema = |bytes: String| json!({"hash":Hash::of(bytes.as_bytes()),"bytes":bytes});
-    let tools: Vec<_> = specifications.iter().map(|(name,input)| json!({"name":name,"path":format!("/{name}"),"hash":entry(name)["executable"],"description":name,"input_schema":schema(input.to_string()),"output_schema":schema(output_schema.clone()),"input_bytes":8192,"output_bytes":32768,"timeout_ms":30000})).collect();
+    let mut tools: Vec<_> = specifications.iter().map(|(name,input)| json!({"name":name,"path":format!("/{name}"),"hash":entry(name)["executable"],"description":name,"input_schema":schema(input.to_string()),"output_schema":schema(output_schema.clone()),"input_bytes":8192,"output_bytes":32768,"timeout_ms":30000})).collect();
+    // Commands borrowed from pinned images at packaging time: each is an argv
+    // tool whose executable the package already hashes under `programs`.
+    let commands: Vec<crate::starter_package::PackagedCommand> = match package.get("commands") {
+        Some(value) => serde_json::from_value(value.clone())?,
+        None => Vec::new(),
+    };
+    let programs = package["programs"]
+        .as_object()
+        .context("programs required")?;
+    for packaged in &commands {
+        crate::tool_commands::validate(&packaged.command)?;
+        let hash = programs
+            .get(&packaged.alias)
+            .and_then(Value::as_str)
+            .with_context(|| format!("package lacks program {}", packaged.alias))?;
+        let input = crate::tool_commands::input_schema(&packaged.command).to_string();
+        let output = pilot::json_harness::argv_output_schema().to_string();
+        let description = crate::tool_commands::description_with_params(&packaged.command);
+        tools.push(json!({"name":packaged.command.name,"path":packaged.alias,"hash":hash,"description":description,"input_schema":schema(input),"output_schema":schema(output),"input_bytes":8192,"output_bytes":8192,"timeout_ms":30000,"argv":{"args":packaged.command.args,"stdin":packaged.command.stdin}}));
+    }
+    ensure!(tools.len() <= 16, "at most 16 borrowed tools per worker");
     let mut template_json = json!({"contract":"celln.json-tools/v1","task":"","system":"Use the borrowed tools when requested. Read files with workspace-read rather than relying on remembered content. Keep replies brief.","url":endpoint,"model":model,"tools":tools,"max_turns":3,"max_calls":1,"require_tool_call":false});
     if connection.is_some_and(|c| c.allow_insecure) {
         template_json["allow_insecure"] = json!(true);
@@ -201,6 +222,13 @@ pub fn run(plan: &Path, root: &Path) -> Result<u8> {
     let profile_hash = Hash::of(&profile);
     let mut catalogue_tools = Vec::new();
     for tool in &template.policy().tools {
+        if let Some(packaged) = commands.iter().find(|c| c.command.name == tool.name) {
+            // A borrowed command: no broker effects, provenance is the image.
+            let limits = json!({"timeoutMillis":30000,"memoryBytes":268435456u64,"argumentBytes":8192,"outputBytes":32768,"workspace":"none","effects":"none"});
+            let worker = entry("worker");
+            catalogue_tools.push(json!({"name":tool.name,"spec":{"revision":"v1","description":tool.description,"supportOwner":"native-starter-operator","publisherKey":worker["publisher"],"executable":{"hash":tool.hash},"closure":{"hash":worker["closure"]},"entryPoint":tool.path,"invocationABI":"celln.argv/v1","argumentsSchema":{"hash":tool.input_schema.hash},"resultSchema":{"hash":tool.output_schema.hash},"platform":"linux/amd64","lane":"tool","sourceImage":packaged.source_image,"limits":limits}}));
+            continue;
+        }
         let bundle = entry(&tool.name);
         let mut limits = json!({"timeoutMillis":30000,"memoryBytes":268435456u64,"argumentBytes":8192,"outputBytes":32768,"workspace":"none","effects":"none"});
         if tool.name == "https-fetch" {
