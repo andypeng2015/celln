@@ -95,6 +95,7 @@ fn config(names: &[&str]) -> Config {
                 input_bytes: 1024,
                 output_bytes: 1024,
                 timeout_ms: 1000,
+                argv: None,
             })
             .collect(),
     }
@@ -374,4 +375,90 @@ fn host_validation_rejects_initial_envelope_overflow_before_execution() {
         |_| {}
     )
     .is_err());
+}
+
+// A borrowed command: validated JSON becomes argv/stdin through the fixed
+// binding, never a shell; its stdout and exit status come back as data.
+#[test]
+fn argv_binding_maps_validated_arguments_and_reports_exit_status() {
+    let output_bytes = 4096;
+    let input = r#"{"type":"object","properties":{"pattern":{"type":"string","minLength":1,"maxLength":64},"text":{"type":"string","minLength":0,"maxLength":1024},"ignore_case":{"type":"boolean"},"count":{"type":"integer","minimum":0,"maximum":9}},"required":["pattern","text"],"additionalProperties":false}"#;
+    let mut tool = Tool {
+        name: "grep".into(),
+        path: "/busybox".into(),
+        hash: format!("blake3:{}", "a".repeat(64)),
+        description: "grep".into(),
+        input_schema: schema(input),
+        output_schema: schema(&argv_output_schema().to_string()),
+        input_bytes: 2048,
+        output_bytes,
+        timeout_ms: 1000,
+        argv: Some(Argv {
+            args: vec![
+                "grep".into(),
+                "{ignore_case?-i}".into(),
+                "{count:-m}".into(),
+                "-e".into(),
+                "{pattern}".into(),
+            ],
+            stdin: Some("text".into()),
+        }),
+    };
+    let mut cfg = config(&[]);
+    cfg.tools = vec![tool.clone()];
+    cfg.max_calls = 1;
+    cfg.max_turns = 2;
+    validate(&cfg).unwrap();
+    let (args, stdin) = argv_invocation(
+        &tool,
+        br#"{"pattern":"vio","text":"violet\norange\n","ignore_case":true,"count":2}"#,
+    )
+    .unwrap();
+    assert_eq!(args, ["grep", "-i", "-m", "2", "-e", "vio"]);
+    assert_eq!(stdin, b"violet\norange\n");
+    let (args, _) = argv_invocation(&tool, br#"{"pattern":"vio","text":""}"#).unwrap();
+    assert_eq!(
+        args,
+        ["grep", "-e", "vio"],
+        "absent optional fields drop their entries, flag included"
+    );
+    assert!(argv_invocation(&tool, br#"{"pattern":"a b","text":""}"#).is_err());
+    let result: Value = serde_json::from_slice(&argv_output(1, b"")).unwrap();
+    assert_eq!(result, json!({"output":"","exit":1}));
+    let long: Value = serde_json::from_slice(&argv_output(0, "é".repeat(5000).as_bytes())).unwrap();
+    assert!(long["output"].as_str().unwrap().len() <= ARGV_OUTPUT_CHARS);
+    assert!(long["output"].as_str().unwrap().starts_with("éé"));
+    // The binding is checked against the schema it is declared with.
+    tool.argv = Some(Argv {
+        args: vec!["{missing}".into()],
+        stdin: None,
+    });
+    cfg.tools = vec![tool.clone()];
+    assert!(validate(&cfg).is_err());
+    tool.argv = Some(Argv {
+        args: vec!["{pattern?-x}".into()],
+        stdin: None,
+    });
+    cfg.tools = vec![tool.clone()];
+    assert!(
+        validate(&cfg).is_err(),
+        "a flag placeholder needs a boolean field"
+    );
+    tool.argv = Some(Argv {
+        args: vec!["grep".into()],
+        stdin: Some("count".into()),
+    });
+    cfg.tools = vec![tool.clone()];
+    assert!(validate(&cfg).is_err(), "stdin needs a string field");
+    tool.argv = Some(Argv {
+        args: vec!["grep".into()],
+        stdin: None,
+    });
+    tool.output_schema =
+        schema(r#"{"type":"object","properties":{},"required":[],"additionalProperties":false}"#);
+    cfg.tools = vec![tool];
+    assert!(
+        validate(&cfg).is_err(),
+        "argv tools return the argv result shape"
+    );
 }

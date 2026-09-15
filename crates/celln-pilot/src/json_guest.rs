@@ -58,13 +58,21 @@ pub fn run(
             )
         },
         |tool, input| {
-            crate::harness_io::child(
-                &tool.path,
-                &[],
-                input,
-                tool.output_bytes,
-                std::time::Duration::from_millis(tool.timeout_ms),
-            )
+            let timeout = std::time::Duration::from_millis(tool.timeout_ms);
+            if tool.argv.is_some() {
+                // A borrowed command: validated arguments become argv/stdin,
+                // stdout and exit status come back as data.
+                let (args, stdin) = crate::json_harness::argv_invocation(tool, input)?;
+                let (exit, stdout) = crate::harness_io::child_status(
+                    &tool.path,
+                    &args,
+                    &stdin,
+                    tool.output_bytes,
+                    timeout,
+                )?;
+                return Ok(crate::json_harness::argv_output(exit, &stdout));
+            }
+            crate::harness_io::child(&tool.path, &[], input, tool.output_bytes, timeout)
         },
         |event| println!("CELLN_HARNESS_EVENT {event}"),
     )?;
