@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.20](https://github.com/sympozium-ai/celln/compare/v0.5.19...v0.5.20) (2026-09-15)
+
+
+### Bug Fixes
+
+* **starter:** look for packaging tools under sbin too ([fa70d12](https://github.com/sympozium-ai/celln/commit/fa70d12d27b56a148ef2c215fe60e568008a31c5))
+* **starter:** look for packaging tools under sbin too ([3ca6b80](https://github.com/sympozium-ai/celln/commit/3ca6b806a8228bd4d2cdffd0bb3e3ad512ad5435))
+
 ## [0.5.19](https://github.com/sympozium-ai/celln/compare/v0.5.18...v0.5.19) (2026-09-15)
 
 
