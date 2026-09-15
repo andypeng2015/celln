@@ -21,6 +21,10 @@ struct Profile {
     /// Operator's logical host-memory reservation, including retained motes,
     /// both VMs, artifact buffers and overhead. Not a physical RSS guarantee.
     reserved_memory_bytes: u64,
+    /// Prior exchanges the parent starts with when it continues a
+    /// conversation; delivered to the guest once, before any turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    history: Vec<pilot::json_harness::Exchange>,
 }
 
 pub(crate) struct Admission {
@@ -160,6 +164,10 @@ struct ProvisionPlan {
     turn_output_tokens: u64,
     total_model_requests: u64,
     total_output_tokens: u64,
+    /// Memory for a continued conversation: bounded prior exchanges the new
+    /// parent is seeded with. Part of the bound plan identity.
+    #[serde(default)]
+    history: Vec<pilot::json_harness::Exchange>,
 }
 
 pub(crate) fn provision_file(root: &Path, path: &Path, principal: &str) -> anyhow::Result<u8> {
@@ -211,6 +219,8 @@ pub(crate) fn provision(
     );
     let incarnation = warden::parent_permit::run_incarnation(&plan.scope, &plan.run_uid)
         .map_err(|e| e.to_string())?;
+    pilot::parent_harness::validate_seed(&plan.history)
+        .map_err(|reason| format!("invalid parent provision plan: {reason}"))?;
     let template =
         pilot::turn_worker::Template::new(plan.template.clone()).map_err(|e| e.to_string())?;
     let binding = warden::parent_permit::Binding {
@@ -243,6 +253,7 @@ pub(crate) fn provision(
         permit: Hash::of(b"not-yet-issued"),
         binding: binding.clone(),
         reserved_memory_bytes: plan.reserved_memory_bytes,
+        history: plan.history,
     };
     // Reject policy mistakes before consuming the durable issuance identity.
     let mut admission = validate_policy(root, profile)?;
@@ -330,6 +341,12 @@ impl Admission {
                 &self.root,
             )?;
             let mut session = parent.into_claimed_session(worker, Some(claim), Some(children))?;
+            if !profile.history.is_empty() {
+                // A continued conversation: the guest starts with its past.
+                session
+                    .seed(&profile.history)
+                    .map_err(|e| format!("seeding parent context: {e}"))?;
+            }
             Ok(
                 Box::new(move |bytes: &[u8]| session.submit(bytes).map_err(|e| e.to_string()))
                     as Handler,
@@ -417,6 +434,7 @@ pub(crate) mod publication_tests {
             turn_output_tokens: 512,
             total_model_requests: 2,
             total_output_tokens: 1024,
+            history: vec![],
         };
         let encode = |plan: &ProvisionPlan| serde_json::to_vec(plan).unwrap();
         assert!(serde_json::to_value(&plan)
@@ -451,12 +469,41 @@ pub(crate) mod publication_tests {
         assert!(provision(root.path(), &encode(&plan), "another-tenant").is_err());
         plan.run_uid = "second-run-uid".into();
         let second = provision(root.path(), &encode(&plan), "test:parent").unwrap();
+        // A continued conversation carries its memory into the launch; an
+        // oversized or malformed seed is an invalid plan, never a silent trim.
+        plan.run_uid = "continued-run-uid".into();
+        plan.history = vec![pilot::json_harness::Exchange {
+            user: "remember the word saffron".into(),
+            assistant: "Noted: saffron.".into(),
+        }];
+        let (launch, _) = provision(root.path(), &encode(&plan), "test:parent").unwrap();
+        let stored: Profile = serde_json::from_slice(
+            &std::fs::read(
+                root.path()
+                    .join("trusted-parent-launches")
+                    .join(format!("{}.json", &launch.0[7..])),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored.history.len(), 1);
+        assert_eq!(stored.history[0].user, "remember the word saffron");
+        plan.run_uid = "oversized-run-uid".into();
+        plan.history = vec![pilot::json_harness::Exchange {
+            user: "u".repeat(1200),
+            assistant: "a".repeat(1200),
+        }];
+        assert!(provision(root.path(), &encode(&plan), "test:parent")
+            .unwrap_err()
+            .starts_with("invalid parent provision plan"));
         assert_ne!(first, second);
+        // Three issued runs: the first, the second and the continued one;
+        // the oversized seed issued nothing.
         assert_eq!(
             std::fs::read_dir(root.path().join("parent-issuance"))
                 .unwrap()
                 .count(),
-            2
+            3
         );
         assert!(!root.path().join("parent-journal").exists());
     }

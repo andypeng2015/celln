@@ -7,6 +7,33 @@ use warden::parent_protocol::{TurnRequest, MAX_REQUEST_BYTES, MAX_TASK_BYTES};
 
 pub const VERSION: &str = "celln.parent-context/v1";
 
+/// Most prior exchanges a continued conversation may seed a new parent with,
+/// and the room a seed must leave inside the turn bound for the first
+/// message that follows it.
+pub const MAX_SEED_EXCHANGES: usize = 16;
+pub const SEED_HEADROOM_BYTES: usize = 512;
+
+/// Check a seed before any host state depends on it: bounded count, text
+/// only, and small enough that a first message still fits the turn bound.
+pub fn validate_seed(history: &[Exchange]) -> Result<(), &'static str> {
+    if history.len() > MAX_SEED_EXCHANGES {
+        return Err("seed exceeds exchange count");
+    }
+    if history.iter().any(|exchange| {
+        exchange.user.trim().is_empty()
+            || exchange.user.contains('\0')
+            || exchange.assistant.contains('\0')
+    }) {
+        return Err("seed exchanges must be non-empty text");
+    }
+    let encoded = serde_json::to_vec(&serde_json::json!({"history":history, "message":""}))
+        .map_err(|_| "seed encoding failed")?;
+    if encoded.len() + SEED_HEADROOM_BYTES > MAX_TASK_BYTES {
+        return Err("seed leaves no room for a first message");
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum HostMessage {
@@ -25,6 +52,14 @@ pub enum HostMessage {
         succeeded: bool,
         answer: String,
     },
+    /// Prior exchanges of a conversation this parent continues, delivered by
+    /// the host once, before any turn. A seeded parent starts with memory;
+    /// nothing in a seed is a turn, a result or an instruction.
+    Seed {
+        #[serde(rename = "apiVersion")]
+        api_version: String,
+        history: Vec<Exchange>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -40,6 +75,11 @@ pub enum ParentReply {
         turn_id: String,
         succeeded: bool,
         answer: String,
+    },
+    Seeded {
+        #[serde(rename = "apiVersion")]
+        api_version: String,
+        exchanges: usize,
     },
 }
 
@@ -60,6 +100,26 @@ impl ParentContext {
         let message: HostMessage =
             serde_json::from_slice(bytes).map_err(|_| "invalid parent message")?;
         match message {
+            HostMessage::Seed {
+                api_version,
+                history,
+            } => {
+                if api_version != VERSION {
+                    return Err("unsupported parent version");
+                }
+                // Only an untouched context accepts memory: never after a
+                // turn was seen, never while one is pending, never twice.
+                if !self.history.is_empty() || self.pending.is_some() || !self.seen.is_empty() {
+                    return Err("seed refused: context already in use");
+                }
+                validate_seed(&history)?;
+                let exchanges = history.len();
+                self.history = history;
+                Ok(ParentReply::Seeded {
+                    api_version: VERSION.into(),
+                    exchanges,
+                })
+            }
             HostMessage::Turn {
                 api_version,
                 turn_id,
@@ -169,6 +229,68 @@ mod tests {
         assert!(parent.exchange(&turn("one", "replay")).is_err());
         parent.exchange(&turn("two", "next")).unwrap();
     }
+    #[test]
+    fn seed_gives_a_new_parent_memory_once_and_only_before_its_first_turn() {
+        let mut context = ParentContext::default();
+        let seed = serde_json::json!({"kind":"seed","apiVersion":VERSION,"history":[
+            {"user":"remember the word saffron","assistant":"Noted: saffron."},
+            {"user":"and the number seven","assistant":"Seven, noted."}
+        ]});
+        let reply = context.exchange(seed.to_string().as_bytes()).unwrap();
+        assert!(matches!(reply, ParentReply::Seeded { exchanges: 2, .. }));
+        // The first turn carries the seeded exchanges as its history.
+        let turn = serde_json::json!({"kind":"turn","apiVersion":VERSION,"turnId":"one","message":"which word?"});
+        let ParentReply::Spawn { request } = context.exchange(turn.to_string().as_bytes()).unwrap()
+        else {
+            panic!("turn must spawn a worker");
+        };
+        let task: serde_json::Value = serde_json::from_str(&request.task).unwrap();
+        assert_eq!(task["history"][0]["user"], "remember the word saffron");
+        assert_eq!(task["history"][1]["assistant"], "Seven, noted.");
+        assert_eq!(task["message"], "which word?");
+        // Never twice, never with a turn pending, never after a turn was seen.
+        assert!(context.exchange(seed.to_string().as_bytes()).is_err());
+        let mut used = ParentContext::default();
+        used.exchange(turn.to_string().as_bytes()).unwrap();
+        assert!(used.exchange(seed.to_string().as_bytes()).is_err());
+        // Bounds: count, text, and room for a first message.
+        let many: Vec<_> = (0..MAX_SEED_EXCHANGES + 1)
+            .map(|i| Exchange {
+                user: format!("u{i}"),
+                assistant: "a".into(),
+            })
+            .collect();
+        assert_eq!(validate_seed(&many), Err("seed exceeds exchange count"));
+        assert!(validate_seed(&[Exchange {
+            user: " ".into(),
+            assistant: "a".into()
+        }])
+        .is_err());
+        assert!(validate_seed(&[Exchange {
+            user: "u".into(),
+            assistant: "a\0".into()
+        }])
+        .is_err());
+        let wide = vec![Exchange {
+            user: "u".repeat(900),
+            assistant: "a".repeat(900),
+        }];
+        assert_eq!(
+            validate_seed(&wide),
+            Err("seed leaves no room for a first message")
+        );
+        assert!(validate_seed(&[]).is_ok());
+        let mut fresh = ParentContext::default();
+        assert!(matches!(
+            fresh.exchange(
+                serde_json::json!({"kind":"seed","apiVersion":"other","history":[]})
+                    .to_string()
+                    .as_bytes()
+            ),
+            Err("unsupported parent version")
+        ));
+    }
+
     #[test]
     fn context_overflow_and_unknown_authority_fail_without_consuming_turn() {
         let mut parent = ParentContext::default();
