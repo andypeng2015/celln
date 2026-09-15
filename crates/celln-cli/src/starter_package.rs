@@ -45,6 +45,11 @@ pub(crate) const STARTER_TOOLS: [&str; 8] = [
 /// Worker tools beyond the brokered ones: the harness admits 24 per template.
 pub(crate) const MAX_BORROWED_COMMANDS: usize = 24 - STARTER_TOOLS.len();
 
+/// Where packaging subprocesses (mke2fs, debugfs, the initramfs script and
+/// its compiler) are looked up: a fixed list, never the caller's PATH, and
+/// including sbin because Debian keeps the e2fsprogs tools there.
+const PACKAGING_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
+
 pub(crate) fn regular(path: &Path, bound: usize) -> Result<Vec<u8>> {
     let file = fs::OpenOptions::new()
         .read(true)
@@ -73,7 +78,7 @@ fn publish(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn command(command: &mut Command) -> Result<()> {
-    let result = command.env_clear().env("PATH", "/usr/bin:/bin").output()?;
+    let result = command.env_clear().env("PATH", PACKAGING_PATH).output()?;
     ensure!(
         result.status.success(),
         "package build subprocess failed (status {}); no completed package was published",
@@ -437,7 +442,7 @@ fn bundle(
         .arg(runtime.join("scripts/mkinitramfs.sh"))
         .arg(&initrd_path)
         .env_clear()
-        .env("PATH", "/usr/bin:/bin")
+        .env("PATH", PACKAGING_PATH)
         .env("CELLN_MANIFEST", assay_root.join("manifest.json"))
         .env("CELLN_PILOT_DIR", runtime.join("pilot"))
         .output()?;
