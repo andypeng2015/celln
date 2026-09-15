@@ -237,7 +237,7 @@ fn refused(reason: &str) -> FetchDenied {
 }
 
 fn parse(raw: &str) -> Result<Request, FetchDenied> {
-    if raw.len() > 8192 {
+    if raw.len() > 32768 {
         return Err(refused("request exceeds broker wire budget"));
     }
     let request: Request =

@@ -227,7 +227,9 @@ impl HttpBroker {
     /// followed one hop at a time so every destination is independently
     /// authorised; `curl --location` would bypass the allowlist on hop two.
     pub fn fetch(&mut self, raw: &str) -> Result<Vec<u8>, FetchDenied> {
-        if raw.len() > 8192 {
+        // Model requests carry every tool schema and the conversation; the
+        // workspace and plain POST paths bound themselves more tightly below.
+        if raw.len() > 32768 {
             return Err(FetchDenied::Fetch(
                 "request exceeds broker wire budget".into(),
             ));

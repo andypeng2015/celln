@@ -74,6 +74,12 @@ pub struct Argv {
 /// bounds strings at this length.
 pub const ARGV_OUTPUT_CHARS: usize = 4096;
 
+/// Most bytes one model request may occupy on the broker wire: the persona,
+/// every selected tool's schema and the conversation so far. A worker with
+/// two dozen tools and a long conversation needs more than the 8 KiB the
+/// workspace and fetch tools are held to.
+pub const MODEL_WIRE_BYTES: usize = 32768;
+
 /// Result shape every argv tool returns to the model; the packager declares
 /// it as such a tool's output schema.
 pub fn argv_output_schema() -> Value {
@@ -433,7 +439,7 @@ fn model_request(
         &json!({"apiVersion":"celln.fetch/v1","method":"POST","url":config.url,"body":body}),
     )?;
     ensure!(
-        wire.len() <= 8192,
+        wire.len() <= MODEL_WIRE_BYTES,
         "conversation/schema envelope exceeds broker byte limit"
     );
     Ok(wire)
