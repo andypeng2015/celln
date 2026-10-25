@@ -20,6 +20,7 @@ pub mod parent_permit;
 pub mod parent_protocol;
 pub mod parent_registry;
 pub mod ratchet;
+pub mod trace;
 pub mod vmm;
 /// Maximum one-shot invocation data, including bounded immutable inputs.
 pub const MAX_INVOCATION_BYTES: usize = 1 << 20;

@@ -360,13 +360,18 @@ pub(super) fn handle(
             )
         }
     };
-    match path {
+    let began = std::time::Instant::now();
+    let served = match path {
         "/v1/scoped/prepare" => prepare(scoped, stream, &body),
         "/v1/scoped/start" => start(dispatcher, scoped, stream, &body, metadata),
         "/v1/scoped/read" => access(dispatcher, scoped, stream, &body, metadata, false),
         "/v1/scoped/cleanup" => access(dispatcher, scoped, stream, &body, metadata, true),
         _ => reply(stream, 404, &json!({"error":"not found"})),
+    };
+    if path != "/v1/scoped/read" {
+        warden::trace::span(&format!("scoped {path}"), began);
     }
+    served
 }
 
 fn prepare(scoped: &ScopedState, stream: &mut std::net::TcpStream, body: &[u8]) -> Result<()> {
@@ -2657,7 +2662,10 @@ fn admission_reply(stream: &mut std::net::TcpStream, error: AdmissionError) -> R
         AdmissionError::BudgetExhausted => (429, "AUTH_BUDGET_EXHAUSTED"),
         AdmissionError::Busy => (409, "AUTH_BUSY"),
         AdmissionError::Fenced => (409, "AUTH_CONTEXT_LOST"),
-        AdmissionError::Unavailable => (503, "AUTH_CONTEXT_LOST"),
+        // The ledger could not be read or locked just now. That is a retry,
+        // never a lost context: the controller ends a run for AUTH_CONTEXT_LOST,
+        // and three runs reading the ledger at once must not kill one of them.
+        AdmissionError::Unavailable => (503, "AUTH_UNAVAILABLE"),
     };
     reply(
         stream,

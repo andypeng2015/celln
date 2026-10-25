@@ -893,6 +893,10 @@ pub struct LinuxCell {
     /// held stopped for however long the caller waited (a parent waiting out
     /// a worker turn). See [`LinuxCell::run`].
     parked: bool,
+    /// When this cell first ran, for operator timing traces.
+    run_started: Option<Instant>,
+    /// The console line being assembled for the operator trace.
+    trace_line: Vec<u8>,
 }
 
 impl LinuxCell {
@@ -1029,6 +1033,8 @@ impl LinuxCell {
             next_tool_gpa: TOOL_WINDOW_GPA,
             cfg,
             parked: false,
+            run_started: None,
+            trace_line: Vec::new(),
         })
     }
 
@@ -1146,6 +1152,18 @@ impl LinuxCell {
                 "http_fetch capability not declared".into(),
             )),
         };
+        if crate::trace::enabled() {
+            crate::trace::note(
+                "fetch",
+                &format!(
+                    "#{} {} ms, {} B, cell at +{:.1}s",
+                    self.fetch_activity.0,
+                    blocked.elapsed().as_millis(),
+                    body.as_ref().map_or(0, Vec::len),
+                    self.run_started.map_or(0.0, |s| s.elapsed().as_secs_f64())
+                ),
+            );
+        }
         if blocked.elapsed() >= Duration::from_secs(1) {
             // The vCPU sat at this port exit for the whole exchange (a model
             // request takes a minute) while the guest's clock ran on. Mark
@@ -1474,6 +1492,8 @@ impl LinuxCell {
                 // the shared console the instant it resumes, while pilot is
                 // writing its startup frames byte by byte over the UART.
                 parked: true,
+                run_started: None,
+                trace_line: Vec::new(),
             },
             t,
         ))
@@ -1506,6 +1526,7 @@ impl LinuxCell {
     pub fn run(&mut self) -> Result<BootReport, VmmError> {
         let control = celln_control::current();
         celln_control::check().map_err(|e| VmmError::Backend(e.to_string()))?;
+        self.run_started.get_or_insert_with(Instant::now);
         if std::mem::take(&mut self.parked) {
             // A parked guest's clock kept running while the host held its
             // vCPU. Without KVM_KVMCLOCK_CTRL the guest kernel sees a vCPU
@@ -1547,6 +1568,7 @@ impl LinuxCell {
         };
 
         let started = Instant::now();
+        let tracing = crate::trace::enabled();
         let mut exits = 0u64;
         let mut sealed_writes_blocked = 0u64;
         let mut revoked_live = false;
@@ -1571,6 +1593,9 @@ impl LinuxCell {
                                 let mut raise = false;
                                 for &b in data {
                                     raise |= self.serial.write(port, b);
+                                    if tracing && port == Serial::BASE {
+                                        trace_console_byte(&mut self.trace_line, b, started);
+                                    }
                                 }
                                 if raise {
                                     // Pulse IRQ 4 so the driver's TX handler
@@ -2617,6 +2642,30 @@ mod tests {
             cell.tool_bytes(&h, tool.len()).unwrap(),
             tool,
             "a full kernel boot must not alter sealed tool bytes"
+        );
+    }
+}
+
+/// Operator timing trace of the guest's own progress lines: every `CELLN:`
+/// marker the guest prints, stamped with the time since the run began.
+/// Dispatch frames are cut to their kind; nothing else the guest prints is
+/// repeated.
+fn trace_console_byte(line: &mut Vec<u8>, byte: u8, run_began: Instant) {
+    if byte != b'\n' {
+        if line.len() < 160 {
+            line.push(byte);
+        }
+        return;
+    }
+    let line = std::mem::take(line);
+    if let Some(text) = std::str::from_utf8(&line)
+        .ok()
+        .filter(|l| l.starts_with("CELLN:"))
+    {
+        let shown: String = text.chars().take(72).collect();
+        crate::trace::note(
+            "console",
+            &format!("+{:.2}s {shown}", run_began.elapsed().as_secs_f64()),
         );
     }
 }

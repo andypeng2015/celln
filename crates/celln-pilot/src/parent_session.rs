@@ -189,8 +189,11 @@ where
             _ => anyhow::bail!("parent did not request a worker"),
         };
         ensure!(request.turn_id == turn_id, "parent changed turn identity");
+        let reserving = std::time::Instant::now();
         let reservation = self.lease.reserve(&serde_json::to_vec(&request)?)?;
         self.journal.reserve(&reservation)?;
+        warden::trace::span("turn reserved", reserving);
+        let working = std::time::Instant::now();
         let controlled = self
             .child_control
             .as_ref()
@@ -202,6 +205,7 @@ where
         } else {
             (self.worker)(&reservation)?
         };
+        warden::trace::span("turn worker", working);
         ensure!(
             result.child == reservation.child,
             "child result owner mismatch"

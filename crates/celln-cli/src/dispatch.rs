@@ -534,6 +534,7 @@ fn run_cell_with_broker(
     broker: Option<warden::egress::HttpBroker>,
 ) -> Result<LaunchOutcome, String> {
     let broker_attached = broker.is_some();
+    let entered = std::time::Instant::now();
     cell.set_timeout(std::time::Duration::from_millis(
         request.capabilities.timeout_ms.max(1),
     ));
@@ -575,6 +576,7 @@ fn run_cell_with_broker(
     }
     let running_at = now_rfc3339();
     let running_observed = std::time::Instant::now();
+    warden::trace::span("worker cell prepared", entered);
     let report = match cell.run() {
         Ok(report) => report,
         Err(error) => {
@@ -584,6 +586,7 @@ fn run_cell_with_broker(
             return Err(error.to_string());
         }
     };
+    warden::trace::span("worker cell ran", running_observed);
 
     let mut outcome = parse_report(
         &report.console,
