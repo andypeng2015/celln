@@ -754,16 +754,9 @@ fn check_members_validated(
 /// frame and its newline. Text after the frame is accepted only when it cannot
 /// carry another frame, so it can never add a grant or hide an exit.
 fn parse_parent_frame(line: &str) -> anyhow::Result<pilot::dispatch_report::Frame> {
-    let mut frames =
-        serde_json::Deserializer::from_str(line).into_iter::<pilot::dispatch_report::Frame>();
-    let frame = frames
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("empty frame"))??;
-    let rest = &line[frames.byte_offset()..];
-    anyhow::ensure!(
-        !rest.contains(pilot::dispatch_report::PREFIX) && !rest.trim_start().starts_with('{'),
-        "trailing frame data"
-    );
+    let frame = super::outcome::parse_frame(line).map_err(anyhow::Error::msg)?;
+    let consumed = serde_json::to_string(&frame).map_or(0, |json| json.len());
+    let rest = line.get(consumed..).unwrap_or_default();
     if !rest.trim().is_empty() {
         eprintln!(
             "celln parent: kernel console text interleaved with a dispatch frame: {:?}",

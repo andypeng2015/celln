@@ -19,7 +19,12 @@ struct Plan {
     package: PathBuf,
     package_hash: String,
     principal: String,
-    credential_file: PathBuf,
+    /// The provider key file of a model this node calls itself. Stated with
+    /// `modelConnection` or not at all: a plan naming neither configures a
+    /// node whose runs each bring their own model route through the scoped
+    /// receiver, and that node holds no model credential.
+    #[serde(default)]
+    credential_file: Option<PathBuf>,
     output: PathBuf,
     #[serde(default)]
     model_connection: Option<ModelConnection>,
@@ -33,6 +38,29 @@ struct Plan {
     /// lowercase DNS names; `"*"` cannot be combined with names.
     #[serde(default)]
     https_hosts: Option<Vec<String>>,
+}
+
+/// The route a model-free configuration's worker template names. It is the
+/// guest-facing alias the scoped receiver gives every mediated run (see
+/// `dispatch_scoped`): the host relays to the operator's gateway and never
+/// resolves this name. No parent is ever provisioned against it.
+const MEDIATED_MODEL_ALIAS: &str = "https://celln-model.invalid/v1/invoke";
+const MEDIATED_MODEL_NAME: &str = "mediated";
+
+/// A model this node calls itself, if the plan states one. There is no
+/// default route: a node either holds a backend's connection and key file, or
+/// serves runs that bring their own route and holds nothing.
+fn model_access(plan: &Plan) -> Result<Option<(&ModelConnection, &PathBuf)>> {
+    match (plan.model_connection.as_ref(), plan.credential_file.as_ref()) {
+        (Some(connection), Some(file)) => Ok(Some((connection, file))),
+        (None, None) => Ok(None),
+        (Some(_), None) => anyhow::bail!(
+            "modelConnection names a model this node calls itself and needs credentialFile; omit both for a configuration whose runs bring their own model route"
+        ),
+        (None, Some(_)) => anyhow::bail!(
+            "credentialFile without modelConnection: this Celln has no default model route; state the backend's modelConnection, or omit credentialFile for a configuration whose runs bring their own model route"
+        ),
+    }
 }
 
 fn resolve_hosts(hosts: Option<&Vec<String>>) -> Result<Vec<String>> {
@@ -76,8 +104,20 @@ struct HostLimits {
 /// The worker template's model loop: `max_turns` model requests, of which all
 /// but the last may carry tool calls, `max_calls` tool calls in total. Four
 /// calls one at a time need five requests; six leaves one to recover.
+/// The persona bound into every fleet profile. It makes the model reach for
+/// the live sources it has (https-fetch) for anything time-sensitive instead
+/// of answering from training data, and names two sources that return
+/// plain, dated, redirect-free text within the fetch body limit.
+const STARTER_SYSTEM_PROMPT: &str = "You have tools; use them. For anything about current events, recent news, or what a person or organisation has been doing lately, do not answer from memory: first call https-fetch on a live source, then answer only from what you fetched, quoting the dates and sources. Recent news with dates: https://news.google.com/rss/search?q=<url-encoded+query>&hl=en-US&gl=US&ceid=US:en (you may add +when:90d to the query). Background: https://en.wikipedia.org/api/rest_v1/page/summary/<Title_With_Underscores>. Read files with workspace-read rather than relying on remembered content. Keep replies brief.";
+/// Largest HTTPS response body a starter tool returns to the model. It is
+/// the tool-schema string bound the *installed starter package's* guest
+/// harness enforces (celln-manifest MAX_STRING_CHARS at the package's build);
+/// a longer page or feed is cut to this by the broker, so its head still
+/// reaches the model. Raising it needs a starter package built with the
+/// larger bound.
+const FETCH_MAX_RESPONSE_BYTES: u64 = 4096;
 const TEMPLATE_MAX_TURNS: u64 = 6;
-const TEMPLATE_MAX_CALLS: u64 = 4;
+const TEMPLATE_MAX_CALLS: u64 = 5;
 /// Each model request may produce this many tokens unless the operator sets
 /// `modelConnection.maxOutputTokens` (the cap the broker enforces).
 const DEFAULT_REQUEST_OUTPUT_TOKENS: u64 = warden::egress::DEFAULT_REQUEST_OUTPUT_TOKENS;
@@ -267,22 +307,27 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
 
 pub fn run(plan: &Path, root: &Path) -> Result<u8> {
     let plan: Plan = serde_json::from_slice(&crate::starter_package::regular(plan, 16384)?)?;
-    let connection = plan.model_connection.as_ref();
+    // Refused before the package, the store or the output are touched.
+    let host_model = model_access(&plan)?;
+    let connection = host_model.map(|(connection, _)| connection);
     let no_parameters = serde_json::Map::new();
     let parameters = connection.map_or(&no_parameters, |c| &c.parameters);
-    // Refused before the package, the store or the output are touched.
     warden::model_parameters::validate(parameters)
         .map_err(|reason| anyhow::anyhow!("modelConnection.parameters refused: {reason}"))?;
-    let request_output_tokens = resolve_request_output_tokens(connection)?;
+    // A node that holds no model is sized for the largest cap a run may
+    // bring: its turn lifetime and the ceilings it publishes afford every
+    // mediated route, and the scoped receiver bounds each run below them.
+    let request_output_tokens = match connection {
+        Some(_) => resolve_request_output_tokens(connection)?,
+        None => *warden::egress::REQUEST_OUTPUT_TOKENS.end(),
+    };
     let turn_tokens = turn_output_tokens(request_output_tokens);
     let limits = resolve_limits(plan.host_limits.as_ref(), request_output_tokens)?;
-    let endpoint = connection.map_or("https://api.deepseek.com/chat/completions", |c| {
-        c.endpoint.as_str()
-    });
-    let model = connection.map_or("deepseek-chat", |c| c.model.as_str());
-    warden::egress::model_endpoint_target(endpoint, connection.is_some_and(|c| c.allow_insecure))
-        .map_err(anyhow::Error::msg)?;
+    let endpoint = connection.map_or(MEDIATED_MODEL_ALIAS, |c| c.endpoint.as_str());
+    let model = connection.map_or(MEDIATED_MODEL_NAME, |c| c.model.as_str());
     if let Some(c) = connection {
+        warden::egress::model_endpoint_target(endpoint, c.allow_insecure)
+            .map_err(anyhow::Error::msg)?;
         let identifier = |s: &str| {
             !s.is_empty()
                 && s.len() <= 64
@@ -313,17 +358,16 @@ pub fn run(plan: &Path, root: &Path) -> Result<u8> {
         root.is_absolute() && plan.output.is_absolute() && !plan.output.try_exists()?,
         "existing authority and new absolute output required"
     );
-    ensure!(
-        plan.credential_file.is_absolute()
-            && !plan
-                .credential_file
-                .starts_with(root.parent().context("state parent required")?)
-            && !plan
-                .credential_file
-                .components()
-                .any(|c| matches!(c, Component::ParentDir | Component::CurDir)),
-        "model credential path must be absolute and outside controller-mounted state"
-    );
+    if let Some((_, credential_file)) = host_model {
+        ensure!(
+            credential_file.is_absolute()
+                && !credential_file.starts_with(root.parent().context("state parent required")?)
+                && !credential_file
+                    .components()
+                    .any(|c| matches!(c, Component::ParentDir | Component::CurDir)),
+            "model credential path must be absolute and outside controller-mounted state"
+        );
+    }
     let candidates = crate::starter_admit::verified(&plan.package, &plan.package_hash, root)?;
     let raw = crate::starter_package::regular(&plan.package.join("package.json"), 65536)?;
     ensure!(
@@ -331,7 +375,9 @@ pub fn run(plan: &Path, root: &Path) -> Result<u8> {
         "package changed during configuration"
     );
     let package: Value = serde_json::from_slice(&raw)?;
-    ensure_package_supports(&package, request_output_tokens)?;
+    if connection.is_some() {
+        ensure_package_supports(&package, request_output_tokens)?;
+    }
     let entries = package["bundles"].as_array().context("bundles required")?;
     let policy: Value = serde_json::from_slice(&crate::starter_package::regular(
         &root.join("trusted-motes.json"),
@@ -361,9 +407,13 @@ pub fn run(plan: &Path, root: &Path) -> Result<u8> {
     let name = json!({"type":"string","minLength":1,"maxLength":256});
     let content = json!({"type":"string","minLength":0,"maxLength":4096});
     let output_schema = json!({"type":"object","properties":{"revision":revision,"content":content,"error":error},"required":[],"additionalProperties":false}).to_string();
+    // A fetched body is returned up to the fetch limit, so the web tool's
+    // result schema admits that much; the workspace tools keep the file bound.
+    let fetched = json!({"type":"string","minLength":0,"maxLength":FETCH_MAX_RESPONSE_BYTES});
+    let fetch_output_schema = json!({"type":"object","properties":{"revision":revision,"content":fetched,"error":error},"required":[],"additionalProperties":false}).to_string();
     let list_output = json!({"type":"object","properties":{"revision":revision,"files":{"type":"array","minItems":0,"maxItems":64,"items":{"type":"object","properties":{"name":name,"bytes":{"type":"integer","minimum":0,"maximum":1048576}},"required":["name","bytes"],"additionalProperties":false}},"error":error},"required":[],"additionalProperties":false}).to_string();
     let search_output = json!({"type":"object","properties":{"revision":revision,"matches":{"type":"array","minItems":0,"maxItems":32,"items":{"type":"object","properties":{"name":name,"line":{"type":"integer","minimum":1,"maximum":1048576},"text":{"type":"string","minLength":0,"maxLength":256}},"required":["name","line","text"],"additionalProperties":false}},"error":error},"required":[],"additionalProperties":false}).to_string();
-    let post_output = json!({"type":"object","properties":{"status":{"type":"integer","minimum":100,"maximum":599},"content":content,"error":error},"required":[],"additionalProperties":false}).to_string();
+    let post_output = json!({"type":"object","properties":{"status":{"type":"integer","minimum":100,"maximum":599},"content":fetched,"error":error},"required":[],"additionalProperties":false}).to_string();
     // Descriptions are what the model reads; names alone leave it guessing
     // which revision to pass or what a search returns.
     let specifications = [
@@ -381,9 +431,9 @@ pub fn run(plan: &Path, root: &Path) -> Result<u8> {
         ),
         (
             "https-fetch",
-            "GET an HTTPS URL on an allowed host; returns the body as text.",
+            "GET an HTTPS URL on an allowed host; returns the body as text, cut at the response limit (a long page or feed returns its head).",
             json!({"type":"object","properties":{"url":{"type":"string","minLength":1,"maxLength":2048}},"required":["url"],"additionalProperties":false}),
-            output_schema.clone(),
+            fetch_output_schema.clone(),
         ),
         (
             "workspace-list",
@@ -440,21 +490,26 @@ pub fn run(plan: &Path, root: &Path) -> Result<u8> {
     }
     ensure!(tools.len() <= 24, "at most 24 borrowed tools per worker");
     let mut template_json = worker_template(
-        json!({"contract":"celln.json-tools/v1","task":"","system":"Use the borrowed tools when requested. Read files with workspace-read rather than relying on remembered content. Keep replies brief.","url":endpoint,"model":model,"tools":tools,"max_turns":TEMPLATE_MAX_TURNS,"max_calls":TEMPLATE_MAX_CALLS,"require_tool_call":false}),
+        json!({"contract":"celln.json-tools/v1","task":"","system":STARTER_SYSTEM_PROMPT,"url":endpoint,"model":model,"tools":tools,"max_turns":TEMPLATE_MAX_TURNS,"max_calls":TEMPLATE_MAX_CALLS,"require_tool_call":false}),
         request_output_tokens,
     );
     if connection.is_some_and(|c| c.allow_insecure) {
         template_json["allow_insecure"] = json!(true);
     }
     let template = pilot::turn_worker::Template::new(serde_json::from_value(template_json)?)?;
-    let profile = serde_json::to_vec(&with_parameters(
-        with_turn_budget(
-            json!({"apiVersion":"celln.parent-model-profile/v1","protocol":connection.map(|c| c.protocol).unwrap_or_default(),"allowInsecure":connection.is_some_and(|c| c.allow_insecure),"principal":plan.principal,"requestBinding":worker.configuration_binding(ConfigurationRole::Worker).map_err(anyhow::Error::msg)?,"templateBinding":template.binding(),"credentialFile":plan.credential_file,"url":template.policy().url,"model":template.policy().model,"workspace":{"read":true,"write":true,"maxOperations":8,"maxFiles":8,"maxFileBytes":4096,"maxTotalBytes":16384},"fetch":{"allowHosts":hosts,"maxRequests":4,"maxResponseBytes":4096,"timeoutMs":10000},"post":{"allowHosts":hosts,"maxRequests":4,"maxBodyBytes":4096,"maxResponseBytes":4096,"timeoutMs":10000}}),
-            request_output_tokens,
-        ),
-        parameters,
-    ))?;
-    let profile_hash = Hash::of(&profile);
+    // The pinned model profile exists only for a model this node calls
+    // itself; a model-free node publishes none and provisions no parent.
+    let profile = match host_model {
+        Some((c, credential_file)) => Some(serde_json::to_vec(&with_parameters(
+            with_turn_budget(
+                json!({"apiVersion":"celln.parent-model-profile/v1","protocol":c.protocol,"allowInsecure":c.allow_insecure,"principal":plan.principal,"requestBinding":worker.configuration_binding(ConfigurationRole::Worker).map_err(anyhow::Error::msg)?,"templateBinding":template.binding(),"credentialFile":credential_file,"url":template.policy().url,"model":template.policy().model,"workspace":{"read":true,"write":true,"maxOperations":8,"maxFiles":8,"maxFileBytes":4096,"maxTotalBytes":16384},"fetch":{"allowHosts":hosts,"maxRequests":4,"maxResponseBytes":FETCH_MAX_RESPONSE_BYTES,"timeoutMs":10000},"post":{"allowHosts":hosts,"maxRequests":4,"maxBodyBytes":4096,"maxResponseBytes":FETCH_MAX_RESPONSE_BYTES,"timeoutMs":10000}}),
+                request_output_tokens,
+            ),
+            parameters,
+        ))?),
+        None => None,
+    };
+    let profile_hash = profile.as_deref().map(Hash::of);
     // A package with a toolbox lends each catalogue tool as its own signed
     // source of that closure, in catalogue order; a borrowed command's
     // catalogue entry names its own source rather than the standing worker.
@@ -487,7 +542,7 @@ pub fn run(plan: &Path, root: &Path) -> Result<u8> {
         let mut limits = json!({"timeoutMillis":30000,"memoryBytes":268435456u64,"argumentBytes":8192,"outputBytes":32768,"workspace":"none","effects":"none"});
         if tool.name == "https-fetch" || tool.name == "https-post-json" {
             limits["effects"] = json!("external-side-effects");
-            limits["https"] = json!({"allowHosts":hosts,"maxRequests":4,"maxResponseBytes":4096,"timeoutMillis":10000});
+            limits["https"] = json!({"allowHosts":hosts,"maxRequests":4,"maxResponseBytes":FETCH_MAX_RESPONSE_BYTES,"timeoutMillis":10000});
         } else {
             // The operation names what the broker will do; changing run data
             // is an effect the operator approves, reading is not.
@@ -513,7 +568,10 @@ pub fn run(plan: &Path, root: &Path) -> Result<u8> {
         // it serves exactly `tools`, every one, in this order.
         catalogue["toolbox"] = runtime(entry("toolbox"));
     }
-    let native = json!({"admissionWindowMs":120000,"parent":parent,"worker":worker,"template":template.policy(),"modelProfile":profile_hash,"reservedMemoryBytes":RESERVED_MEMORY_BYTES,"maxTurns":limits.max_turns,"turnModelRequests":TURN_MODEL_REQUESTS,"turnOutputTokens":turn_tokens,"totalModelRequests":limits.max_model_requests,"totalOutputTokens":limits.max_output_tokens});
+    let mut native = json!({"admissionWindowMs":120000,"parent":parent,"worker":worker,"template":template.policy(),"reservedMemoryBytes":RESERVED_MEMORY_BYTES,"maxTurns":limits.max_turns,"turnModelRequests":TURN_MODEL_REQUESTS,"turnOutputTokens":turn_tokens,"totalModelRequests":limits.max_model_requests,"totalOutputTokens":limits.max_output_tokens});
+    if let Some(hash) = &profile_hash {
+        native["modelProfile"] = json!(hash);
+    }
     let catalogue_bytes = serde_json::to_vec_pretty(&catalogue)?;
     let native_bytes = serde_json::to_vec_pretty(&native)?;
     fs::DirBuilder::new().mode(0o700).create(&plan.output)?;
@@ -523,19 +581,26 @@ pub fn run(plan: &Path, root: &Path) -> Result<u8> {
         &plan.output.join("scoped-parent-request.json"),
         &serde_json::to_vec_pretty(&scoped_parent_request(&parent))?,
     )?;
-    let profiles = root.join("trusted-parent-models");
-    fs::create_dir_all(&profiles)?;
-    let path = profiles.join(format!("{}.json", &profile_hash.0[7..]));
-    if path.try_exists()? {
-        ensure!(
-            crate::starter_package::regular(&path, 65536)? == profile,
-            "existing model profile differs"
-        );
-    } else {
-        write_new(&path, &profile)?;
+    if let (Some(profile), Some(profile_hash)) = (&profile, &profile_hash) {
+        let profiles = root.join("trusted-parent-models");
+        fs::create_dir_all(&profiles)?;
+        let path = profiles.join(format!("{}.json", &profile_hash.0[7..]));
+        if path.try_exists()? {
+            ensure!(
+                crate::starter_package::regular(&path, 65536)? == *profile,
+                "existing model profile differs"
+            );
+        } else {
+            write_new(&path, profile)?;
+        }
+        fs::File::open(profiles)?.sync_all()?;
     }
-    fs::File::open(profiles)?.sync_all()?;
-    let mut complete = json!({"apiVersion":"celln.native-starter-configured/v1","packageHash":plan.package_hash,"catalogueHash":Hash::of(&catalogue_bytes),"nativeTemplateHash":Hash::of(&native_bytes),"principal":plan.principal,"modelProfile":profile_hash,"model":{"provider":"deepseek","model":"deepseek-chat"},"hostLimits":{"leaseSeconds":limits.lease_seconds,"maxTurns":limits.max_turns,"maxModelRequests":limits.max_model_requests,"maxOutputTokens":limits.max_output_tokens},"httpsHosts":hosts,"executionAuthorized":false,"readiness":"not_established"});
+    // A model-free receipt names no `modelProfile` and no `model`: the node
+    // calls no provider, and every run's route arrives signed with the run.
+    let mut complete = json!({"apiVersion":"celln.native-starter-configured/v1","packageHash":plan.package_hash,"catalogueHash":Hash::of(&catalogue_bytes),"nativeTemplateHash":Hash::of(&native_bytes),"principal":plan.principal,"hostLimits":{"leaseSeconds":limits.lease_seconds,"maxTurns":limits.max_turns,"maxModelRequests":limits.max_model_requests,"maxOutputTokens":limits.max_output_tokens},"httpsHosts":hosts,"executionAuthorized":false,"readiness":"not_established"});
+    if let Some(hash) = &profile_hash {
+        complete["modelProfile"] = json!(hash);
+    }
     if let Some(c) = connection {
         complete["model"] = with_request_output_tokens(
             with_parameters(
@@ -750,9 +815,98 @@ mod tests {
     }
 
     #[test]
+    fn a_model_is_stated_with_its_credential_or_not_at_all() {
+        let plan = |model: Value, credential: Value| -> Plan {
+            serde_json::from_value(json!({
+                "apiVersion":"celln.native-starter-config/v1","package":"/p","packageHash":"blake3:x",
+                "principal":"operator:test","output":"/o","modelConnection":model,"credentialFile":credential
+            }))
+            .unwrap()
+        };
+        let connection = json!({"provider":"llama-server","protocol":"openai-chat","endpoint":"http://10.0.0.5:8080/v1/chat/completions","model":"qwen","credentialProfile":"local","allowInsecure":true});
+        assert!(model_access(&plan(Value::Null, Value::Null))
+            .unwrap()
+            .is_none());
+        let keyed = plan(connection.clone(), json!("/etc/celln-native/token"));
+        let (c, file) = model_access(&keyed).unwrap().unwrap();
+        assert_eq!(
+            (c.model.as_str(), file.to_str().unwrap()),
+            ("qwen", "/etc/celln-native/token")
+        );
+        // The DeepSeek default is gone: a credential alone names no route.
+        let error = model_access(&plan(Value::Null, json!("/etc/celln-native/token")))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("no default model route"), "{error}");
+        let error = model_access(&plan(connection, Value::Null))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("needs credentialFile"), "{error}");
+    }
+
+    #[test]
+    fn a_model_free_plan_is_judged_before_anything_is_touched() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("authority");
+        fs::create_dir(&root).unwrap();
+        let attempt = |plan_json: Value| {
+            let output = dir.path().join("configured");
+            let plan = dir.path().join("plan.json");
+            let mut plan_json = plan_json;
+            plan_json["apiVersion"] = json!("celln.native-starter-config/v1");
+            plan_json["package"] = json!(dir.path().join("absent"));
+            plan_json["packageHash"] = json!(format!("blake3:{}", "a".repeat(64)));
+            plan_json["principal"] = json!("operator:test");
+            plan_json["output"] = json!(output);
+            fs::write(&plan, serde_json::to_vec(&plan_json).unwrap()).unwrap();
+            let error = run(&plan, &root).unwrap_err().to_string();
+            assert!(!output.exists());
+            assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+            error
+        };
+        // The old shape, a credential and the implied DeepSeek route, is
+        // refused from the plan alone.
+        assert!(attempt(json!({"credentialFile":"/etc/celln-native/token"}))
+            .contains("no default model route"));
+        // A model-free plan passes the model gate; its ceilings are judged at
+        // the largest cap a run may bring, so the refusal names 4096.
+        let error = attempt(json!({"hostLimits":{"maxOutputTokens":3072}}));
+        assert_eq!(
+            error,
+            "hostLimits.maxOutputTokens 3072 is below one turn's allowance of 24576 output tokens (6 model requests of 4096)"
+        );
+        // With affordable ceilings the refusal is about the absent package.
+        let error = attempt(json!({}));
+        assert!(
+            !error.contains("model") && !error.contains("credential"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_model_free_node_is_sized_for_the_largest_cap() {
+        let cap = *warden::egress::REQUEST_OUTPUT_TOKENS.end();
+        assert_eq!(cap, 4096);
+        assert_eq!(worker_timeout_ms(cap), MAX_WORKER_TIMEOUT_MS);
+        let defaults = resolve_limits(None, cap).unwrap();
+        assert_eq!(
+            (defaults.max_model_requests, defaults.max_output_tokens),
+            (72, 294_912)
+        );
+        // The template's route is the scoped alias, a name the host never resolves.
+        let template = pilot::turn_worker::Template::new(
+            serde_json::from_value(json!({"contract":"celln.json-tools/v1","task":"","system":"s","url":MEDIATED_MODEL_ALIAS,"model":MEDIATED_MODEL_NAME,"tools":[],"max_turns":TEMPLATE_MAX_TURNS,"max_calls":TEMPLATE_MAX_CALLS,"require_tool_call":false,"max_tokens":cap})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(template.policy().url, MEDIATED_MODEL_ALIAS);
+    }
+
+    #[test]
     fn a_turn_affords_the_template_loop_and_totals_afford_every_turn() {
         // Four tool calls made one at a time take five model requests.
-        assert_eq!((TEMPLATE_MAX_TURNS, TEMPLATE_MAX_CALLS), (6, 4));
+        assert_eq!((TEMPLATE_MAX_TURNS, TEMPLATE_MAX_CALLS), (6, 5));
         assert_eq!((TURN_MODEL_REQUESTS, turn_output_tokens(512)), (6, 3072));
         let defaults = resolve_limits(None, 512).unwrap();
         assert_eq!(
@@ -936,7 +1090,7 @@ mod tests {
             r#"{"apiVersion":"celln.parent-model-profile/v1","maxOutputTokens":4096,"maxRequests":6,"maxTotalOutputTokens":24576,"model":"deepseek-chat"}"#
         );
         // The worker template and the receipt name the cap only off default.
-        let template = json!({"contract":"celln.json-tools/v1","max_turns":6,"max_calls":4});
+        let template = json!({"contract":"celln.json-tools/v1","max_turns":6,"max_calls":5});
         assert_eq!(worker_template(template.clone(), 512), template);
         assert_eq!(worker_template(template.clone(), 2048)["max_tokens"], 2048);
         let typed = |cap| {
@@ -950,7 +1104,7 @@ mod tests {
         // The template identity existing fleets pinned is unchanged at 512.
         assert_eq!(
             serde_json::to_string(typed(512).policy()).unwrap(),
-            r#"{"contract":"celln.json-tools/v1","task":"","system":"s","url":"https://api.deepseek.com/chat/completions","model":"deepseek-chat","tools":[],"max_turns":6,"max_calls":4}"#
+            r#"{"contract":"celln.json-tools/v1","task":"","system":"s","url":"https://api.deepseek.com/chat/completions","model":"deepseek-chat","tools":[],"max_turns":6,"max_calls":5}"#
         );
         assert_eq!(typed(4096).policy().max_tokens, 4096);
         assert_ne!(typed(4096).binding(), typed(512).binding());

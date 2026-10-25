@@ -14,6 +14,10 @@ pub use post::{
     DEFAULT_REQUEST_OUTPUT_TOKENS, REQUEST_OUTPUT_TOKENS,
 };
 
+/// Most a GET downloads before it is cut to the grant; bounds the transfer a
+/// guest can cause, independently of how much of it the guest may see.
+const GET_DOWNLOAD_CAP: usize = 1 << 20;
+
 /// The tool allowlist sentinel: `["*"]`, and only that, lets a web tool
 /// reach any **public** HTTPS host. It never widens the model path, never
 /// admits HTTP, a non-443 port, an unverified certificate or a private,
@@ -444,7 +448,7 @@ impl HttpBroker {
                     .arg("--max-time")
                     .arg(timeout.as_secs_f64().to_string())
                     .arg("--max-filesize")
-                    .arg(max_response_bytes.to_string())
+                    .arg(GET_DOWNLOAD_CAP.to_string())
                     .arg("--resolve")
                     .arg(format!(
                         "{}:{}:{}",
@@ -462,16 +466,25 @@ impl HttpBroker {
                     String::from_utf8_lossy(&out.stderr).trim().into(),
                 ));
             }
-            if out.stdout.len() > max_response_bytes {
-                return Err(FetchDenied::Fetch("response exceeded byte budget".into()));
-            }
             let (status, location) = response_status_and_location(&headers)
                 .ok_or_else(|| FetchDenied::Fetch("missing HTTP response headers".into()))?;
             if !(300..400).contains(&status) {
                 if status >= 400 {
                     return Err(FetchDenied::Fetch(format!("HTTP {status}")));
                 }
-                return Ok(out.stdout);
+                // A web tool returns the body as text: a page or feed larger
+                // than the grant is cut to the grant (on a character boundary)
+                // rather than refused, so the model still sees its head. The
+                // grant stays the bound on what reaches the guest.
+                let mut body = out.stdout;
+                if body.len() > max_response_bytes {
+                    let mut end = max_response_bytes;
+                    while end > 0 && (body[end] & 0xC0) == 0x80 {
+                        end -= 1;
+                    }
+                    body.truncate(end);
+                }
+                return Ok(body);
             }
             let location =
                 location.ok_or_else(|| FetchDenied::Fetch("redirect without Location".into()))?;

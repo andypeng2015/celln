@@ -247,7 +247,7 @@ mod tests {
         assert!(!root.join("trusted-parent-permits").exists());
         let configured = dir.path().join("configured");
         let config_plan = dir.path().join("config-plan.json");
-        fs::write(&config_plan, serde_json::to_vec(&json!({"apiVersion":"celln.native-starter-config/v1","package":package,"packageHash":expected,"principal":"operator:native-test","credentialFile":"/etc/celln-native/not-read-test-token","output":configured})).unwrap()).unwrap();
+        fs::write(&config_plan, serde_json::to_vec(&json!({"apiVersion":"celln.native-starter-config/v1","package":package,"packageHash":expected,"principal":"operator:native-test","output":configured})).unwrap()).unwrap();
         assert_eq!(
             crate::starter_configure::run(&config_plan, &root).unwrap(),
             0

@@ -1139,12 +1139,21 @@ impl LinuxCell {
             .map(str::to_owned)
             .unwrap_or_default();
         self.fetch_request.clear();
+        let blocked = Instant::now();
         let body = match self.http.as_mut() {
             Some(broker) => broker.fetch(&request),
             None => Err(crate::egress::FetchDenied::Host(
                 "http_fetch capability not declared".into(),
             )),
         };
+        if blocked.elapsed() >= Duration::from_secs(1) {
+            // The vCPU sat at this port exit for the whole exchange (a model
+            // request takes a minute) while the guest's clock ran on. Mark
+            // the gap as a host pause before re-entry, as a parked parent
+            // gets, or the guest's lockup watchdog reports the stall on the
+            // shared console, inside whatever pilot is printing.
+            let _ = self.vcpu.kvmclock_ctrl();
+        }
         let bytes = match body {
             Ok(body) => {
                 self.fetch_activity.2 = self.fetch_activity.2.saturating_add(body.len() as u64);
@@ -1458,7 +1467,13 @@ impl LinuxCell {
                 next_slot,
                 next_tool_gpa: TOOL_WINDOW_GPA,
                 cfg: mote.cfg.clone(),
-                parked: false,
+                // A fork resumes a guest whose vCPU the host has held since
+                // the template parked, minutes or hours ago. Its first run
+                // must give it the same stopped-clock courtesy a parked
+                // parent gets, or the guest kernel reports a soft lockup on
+                // the shared console the instant it resumes, while pilot is
+                // writing its startup frames byte by byte over the UART.
+                parked: true,
             },
             t,
         ))
