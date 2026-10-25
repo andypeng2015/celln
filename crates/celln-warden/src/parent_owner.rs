@@ -89,8 +89,12 @@ impl ParentOwner {
                     if owner_control.check().is_err() {
                         return;
                     }
+                    let initializing = std::time::Instant::now();
                     let mut runtime = match initialize() {
-                        Ok(runtime) => runtime,
+                        Ok(runtime) => {
+                            crate::trace::span("parent owner initialized", initializing);
+                            runtime
+                        }
                         Err(error) => {
                             // Initialization has not accepted guest input. Keep
                             // its bounded diagnostic for both already-queued

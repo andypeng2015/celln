@@ -232,8 +232,10 @@ impl PreparedParent {
             ..
         } = self.launch_claimed(claim)?;
         let transport = move |bytes: &[u8]| -> anyhow::Result<Vec<u8>> {
+            let exchanging = std::time::Instant::now();
             cell.deliver_parent_message(bytes)?;
             let report = cell.run()?;
+            warden::trace::span("parent exchange", exchanging);
             anyhow::ensure!(
                 report.end == warden::vmm::boot::BootEnd::Parked,
                 "parent did not yield a mailbox response (run ended {:?}); parent console: {}",
@@ -300,6 +302,7 @@ impl PreparedParent {
     }
 
     fn launch_claimed(mut self, claim: Option<ParentClaim>) -> Result<ForkedParent, String> {
+        let prelaunch = std::time::Instant::now();
         validate_parent_request(&self.request, &self.binding)?;
         authorize(&self.request, &self.state_root)?;
         let closure =
@@ -334,7 +337,10 @@ impl PreparedParent {
             )
             .map_err(|e| e.to_string())?,
         };
+        warden::trace::span("parent prelaunch checks", prelaunch);
+        let forking = std::time::Instant::now();
         let mut cell = self.declared.mote.fork()?;
+        warden::trace::span("parent fork", forking);
         cell.set_timeout(std::time::Duration::from_millis(self.binding.lifetime_ms));
         cell.set_invocation(&invocation)
             .map_err(|e| e.to_string())?;
@@ -356,7 +362,9 @@ impl PreparedParent {
             .map_err(|e| e.to_string())?
         );
         cell.stop_when_guest_prints(&marker);
+        let booting = std::time::Instant::now();
         let started = cell.run().map_err(|e| e.to_string())?;
+        warden::trace::span("parent boot to grant", booting);
         if started.end != warden::vmm::boot::BootEnd::Parked
             || !started.console.ends_with(&marker)
             || started.console.contains("Linux version")
@@ -516,11 +524,15 @@ fn prepare_declared_mode(
         celln_control::check().map_err(|e| e.to_string())?;
     }
     authorize(request, state_root)?;
+    let preparing = std::time::Instant::now();
     let inputs = super::inputs::resolve(request, state_root)?;
     let resolved = super::resolve_bundle(request, mote_root, tool_root)?;
+    warden::trace::span("declared bundle resolved", preparing);
     let local_agent = local_agent_constraint(&resolved.program_hash, state_root)?;
+    let closing = std::time::Instant::now();
     let closure = super::closure::resolve(request, &resolved, state_root)?;
     let harness = super::harness::resolve(request, closure.as_ref(), state_root)?;
+    warden::trace::span("declared closure and harness resolved", closing);
     if !matches!(
         resolved.format.as_deref(),
         Some("celln.warm-static-v1" | "celln.warm-closure-v1")
@@ -754,16 +766,9 @@ fn check_members_validated(
 /// frame and its newline. Text after the frame is accepted only when it cannot
 /// carry another frame, so it can never add a grant or hide an exit.
 fn parse_parent_frame(line: &str) -> anyhow::Result<pilot::dispatch_report::Frame> {
-    let mut frames =
-        serde_json::Deserializer::from_str(line).into_iter::<pilot::dispatch_report::Frame>();
-    let frame = frames
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("empty frame"))??;
-    let rest = &line[frames.byte_offset()..];
-    anyhow::ensure!(
-        !rest.contains(pilot::dispatch_report::PREFIX) && !rest.trim_start().starts_with('{'),
-        "trailing frame data"
-    );
+    let frame = super::outcome::parse_frame(line).map_err(anyhow::Error::msg)?;
+    let consumed = serde_json::to_string(&frame).map_or(0, |json| json.len());
+    let rest = line.get(consumed..).unwrap_or_default();
     if !rest.trim().is_empty() {
         eprintln!(
             "celln parent: kernel console text interleaved with a dispatch frame: {:?}",

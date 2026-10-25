@@ -14,6 +14,10 @@ use std::{
 pub const PROFILE: &str = "celln.tool-schema/v1";
 pub const MAX_SCHEMA_BYTES: usize = 32768;
 pub const MAX_VALUE_BYTES: usize = 65536;
+/// Longest string a tool schema may bound. Every installed guest harness
+/// enforces the value its package was built with, so raising it is a
+/// starter-package change, not a host change.
+pub const MAX_STRING_CHARS: usize = 4096;
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
@@ -128,7 +132,7 @@ impl Node {
             Self::String {
                 min_length,
                 max_length,
-            } if min_length > max_length || *max_length > 4096 => {
+            } if min_length > max_length || *max_length > MAX_STRING_CHARS => {
                 return Err("invalid string bounds".into());
             }
             Self::Integer { minimum, maximum } if minimum > maximum => {

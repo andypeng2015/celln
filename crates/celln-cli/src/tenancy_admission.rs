@@ -284,8 +284,19 @@ impl Journal {
             .open(self.root().join("admission.lock"))
             .map_err(|_| Error::Unavailable)?;
         private_regular(&file)?;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(Error::Unavailable);
+        // Holders keep the lock for one small file read and write. Wait a
+        // bounded moment for a concurrent operation on this receiver rather
+        // than refusing: a refusal here is a 503 the caller must retry, and
+        // several runs reading at once is the normal case, not a fault.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(Error::Unavailable);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
         Ok(Lock {
             file,

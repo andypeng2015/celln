@@ -4,9 +4,13 @@
 use std::sync::{Arc, Mutex, OnceLock};
 use warden::vmm::boot::{BootConfig, BootEnd, LinuxCell, Mote};
 
-// The cache retains one template. Explicit pins and in-flight forks can retain
-// evicted templates too; their owners must account for that memory separately.
-type Cached = Option<(String, Arc<Mote>, Availability)>;
+// The cache retains the most recently used templates, up to WARM_TEMPLATES:
+// a fleet node keeps a parent template and a worker template warm at once
+// (they differ by key), and a start that had to boot both again cost six
+// seconds. Explicit pins and in-flight forks can retain evicted templates
+// too; their owners must account for that memory separately.
+type Cached = Vec<(String, Arc<Mote>, Availability)>;
+const WARM_TEMPLATES: usize = 4;
 
 #[derive(Clone, serde::Serialize)]
 pub(crate) struct Availability {
@@ -18,13 +22,20 @@ pub(crate) struct Availability {
 /// Advisory identity hints only: never bypass pinning, integrity or policy.
 /// None means the cache is busy/unknown, not proof it is empty.
 pub(crate) fn availability() -> Option<Vec<Availability>> {
-    let cache = CACHE.get_or_init(|| Mutex::new(None)).try_lock().ok()?;
+    let cache = CACHE
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .try_lock()
+        .ok()?;
     Some(cache.iter().map(|(_, _, hint)| hint.clone()).collect())
 }
 static CACHE: OnceLock<Mutex<Cached>> = OnceLock::new();
 #[cfg(test)]
 pub(crate) fn evict() {
-    *CACHE.get_or_init(|| Mutex::new(None)).lock().unwrap() = None;
+    CACHE
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .clear();
     warden::vmm::kvm::collect_unused_tools();
 }
 #[cfg(test)]
@@ -63,7 +74,7 @@ pub(super) fn pin(
     prepare: impl FnOnce() -> Result<(BootConfig, Vec<u8>), String>,
 ) -> Result<PinnedMote, String> {
     let mote = {
-        let mutex = CACHE.get_or_init(|| Mutex::new(None));
+        let mutex = CACHE.get_or_init(|| Mutex::new(Vec::new()));
         let mut cache = loop {
             celln_control::check().map_err(|e| e.to_string())?;
             match mutex.try_lock() {
@@ -76,8 +87,12 @@ pub(super) fn pin(
                 }
             }
         };
-        if let Some((_, mote, _)) = cache.as_ref().filter(|(k, _, _)| k == &key) {
-            Arc::clone(mote)
+        if let Some(index) = cache.iter().position(|(k, _, _)| k == &key) {
+            // Most recently used last; the front is evicted first.
+            let entry = cache.remove(index);
+            let mote = Arc::clone(&entry.1);
+            cache.push(entry);
+            mote
         } else {
             let (cfg, payload) = prepare()?;
             let hint = Availability {
@@ -90,12 +105,14 @@ pub(super) fn pin(
                 guest_memory_bytes: cfg.mem_size as u64,
             };
             celln_control::check().map_err(|e| e.to_string())?;
+            let booting = std::time::Instant::now();
             let mut template = LinuxCell::boot(cfg).map_err(|e| e.to_string())?;
             template
                 .seal_tool(&celln_manifest::Hash::of(&payload), &payload)
                 .map_err(|e| e.to_string())?;
             template.stop_when_guest_prints("CELLN:mote=parked");
             let report = template.run().map_err(|e| e.to_string())?;
+            warden::trace::span("warm template boot to park", booting);
             if report.end != BootEnd::Parked {
                 // This is pre-invocation boot of the immutable template: no
                 // task, model permit, or provider credential has entered it.
@@ -120,7 +137,10 @@ pub(super) fn pin(
             PREPARATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             // Drop the only shared writable RAM mapping before publishing.
             drop(template);
-            *cache = Some((key, Arc::clone(&mote), hint));
+            if cache.len() >= WARM_TEMPLATES {
+                cache.remove(0);
+            }
+            cache.push((key, Arc::clone(&mote), hint));
             warden::vmm::kvm::collect_unused_tools();
             mote
         }
@@ -185,7 +205,7 @@ mod tests {
     }
     #[test]
     fn deadline_interrupts_waiting_for_another_preparation() {
-        let _guard = CACHE.get_or_init(|| Mutex::new(None)).lock().unwrap();
+        let _guard = CACHE.get_or_init(|| Mutex::new(Vec::new())).lock().unwrap();
         let worker = std::thread::spawn(|| {
             let c = celln_control::Control::new(std::time::Duration::from_millis(30)).unwrap();
             c.scope(|| fork("not-prepared".into(), vec![], || panic!("must not prepare")))

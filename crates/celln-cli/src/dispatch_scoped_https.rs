@@ -65,7 +65,7 @@ fn limits(value: &Value, tool_timeout: &Value) -> Result<Limits, String> {
         return Err("AUTH_PROTOCOL_UNSUPPORTED".into());
     }
     if !(1..=16).contains(&limits.max_requests)
-        || !(1..=4096).contains(&limits.max_response_bytes)
+        || !(1..=65536).contains(&limits.max_response_bytes)
         || !(1..=30000).contains(&limits.timeout_millis)
         || limits.timeout_millis > tool_timeout
     {

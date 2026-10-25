@@ -97,27 +97,38 @@ requires all five motes already admitted. The strict plan is:
   "package": "/var/lib/celln-packages/REVIEWED_PACKAGE",
   "packageHash": "blake3:REVIEWED_PACKAGE_JSON_HASH",
   "principal": "sympozium:celln-agents",
-  "credentialFile": "/etc/celln-native/model-token",
   "output": "/var/lib/celln-configurations/NEW_CONFIGURATION"
 }
 ```
 
-This explicitly approves the fixed first profile: DeepSeek `deepseek-chat`,
-three borrowed tools (run-owned read/write and bounded `example.com` HTTPS),
-one-hour parent lease, twelve turns, at most 72 model requests and 36864 output
-tokens. Per-turn limits are six model requests and 3072 output tokens, which
-affords the worker template's loop of up to four tool calls (`max_calls: 4`,
-`max_turns: 6`). Every turn reserves its whole per-turn allowance from the
-parent totals, so `hostLimits` must afford `maxTurns` × 6 requests and
-`maxTurns` × 3072 tokens for every turn to be usable. Those token figures are
-for the default per-request cap of 512; `modelConnection.maxOutputTokens`
-(below) scales them. `hostLimits` ranges: `leaseSeconds` 60..=86400, `maxTurns`
-1..=1024, `maxModelRequests` 6..=6144, `maxOutputTokens` from one turn's
-allowance up to 25165824 (1024 turns × 6 requests × 4096 tokens). Files
-are bounded to eight, 4096 bytes each, 16384 bytes total. Read/write and HTTPS
-effects each have four-operation limits. This is not arbitrary tool or model
-configuration. The credential path must be outside controller-mounted state;
-the command never reads the credential itself.
+This plan names no model, and that is the normal shape: the node calls no
+provider itself and holds no provider key. Every run that reaches it through
+the scoped receiver brings its own signed model route (provider, endpoint
+origin, model and credential source), the host relays each request to the
+operator's gateway, and the worker template records only the guest-facing
+alias `https://celln-model.invalid/v1/invoke`. No `trusted-parent-models`
+profile is written and `configured.json` carries neither `modelProfile` nor
+`model`. Such a node sizes its turn lifetime (five minutes) and its default
+ceilings for the largest per-request cap a run may bring, 4096 output tokens:
+a turn reserves 6 requests × 4096 = 24576 tokens, and `hostLimits.maxOutputTokens`
+must afford at least one such turn. The default ceilings are a one-hour parent
+lease, twelve turns, 72 model requests and 294912 output tokens.
+
+The plan approves the reviewed starter toolbox: run-owned files (read, write,
+list, append, search, delete) and bounded HTTPS (GET and JSON POST) to any
+public host or the `httpsHosts` list. Files are bounded to eight, 4096 bytes
+each, 16384 bytes total; file effects and HTTPS each have four-operation
+limits. The worker template's loop allows up to four tool calls (`max_calls:
+4`, `max_turns: 6`). `hostLimits` ranges: `leaseSeconds` 60..=86400,
+`maxTurns` 1..=1024, `maxModelRequests` 6..=6144, `maxOutputTokens` from one
+turn's allowance up to 25165824 (1024 turns × 6 requests × 4096 tokens).
+This is not arbitrary tool or model configuration.
+
+A node may instead call one model itself, by stating `modelConnection` and
+`credentialFile` together (see below). There is no default route: a plan that
+names a credential without a connection is refused, and so is a connection
+without a credential. The credential path must be outside controller-mounted
+state; the command never reads the credential itself.
 
 Configuration also records what the scoped receiver needs to build a mediated
 run's worker from catalogue material: every tool's public schema bytes go into
@@ -131,8 +142,10 @@ same identity is refused.
 
 ### Model connection and backend parameters
 
-The optional `modelConnection` replaces the default DeepSeek route. It is
-strict (unknown fields refuse):
+A node that calls one model itself states `modelConnection` with
+`credentialFile`. The connection is strict (unknown fields refuse), and its
+per-request cap sizes the turn lifetime and the default ceilings (512 output
+tokens unless `maxOutputTokens` says otherwise):
 
 ```json
 "modelConnection": {
