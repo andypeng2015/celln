@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.5.35](https://github.com/sympozium-ai/celln/compare/v0.5.34...v0.5.35) (2026-10-28)
+
+
+### Features
+
+* model-free starter configure, fetch-first persona, fork clock courtesy, readable report denials ([f8417e2](https://github.com/sympozium-ai/celln/commit/f8417e25dbfa1e20b8d6b0fa7aea454318c2b14f))
+* model-free starter configure, fork clock courtesy, warm cache, readable denials ([1f2e742](https://github.com/sympozium-ai/celln/commit/1f2e742eb5bea4e2c9a5ec68b713ec6e86643c2b))
+
+
+### Bug Fixes
+
+* **warden:** move trace_console_byte above the test module ([522fea3](https://github.com/sympozium-ai/celln/commit/522fea3e06d4b53a6380766b7565b3f48faeaf03))
+* **warden:** move trace_console_byte above the test module ([ba18702](https://github.com/sympozium-ai/celln/commit/ba1870224ae2287ffc88988965bde94de9cffa3e))
+
+
+### Performance Improvements
+
+* **dispatcher:** warm templates stay warm, ledger lock waits, timing traces ([a7a2934](https://github.com/sympozium-ai/celln/commit/a7a293466545f3b5254308fba56a2dcdc7b52674))
+* **pilot:** verify sealed closures through mappings; harness trusts pilot's check ([b4161f7](https://github.com/sympozium-ai/celln/commit/b4161f73337cb881b2dfb32ff9460f5541d6e8f0))
+* **pilot:** verify sealed closures through mappings; harness trusts pilot's check ([99e3573](https://github.com/sympozium-ai/celln/commit/99e357339fc74fd926d64ecaf670a8b650b2d72d))
+
 ## [0.5.34](https://github.com/sympozium-ai/celln/compare/v0.5.33...v0.5.34) (2026-10-05)
 
 
