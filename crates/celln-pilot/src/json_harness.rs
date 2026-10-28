@@ -381,6 +381,7 @@ pub fn run_with_history(
     mut event: impl FnMut(Value),
 ) -> Result<String> {
     let tools = compile(config)?;
+    event(json!({"type":"ready","tools":tools.len()}));
     let offered = history.len();
     let history = fit_history(config, &tools, history)?;
     if history.len() < offered {

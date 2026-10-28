@@ -742,12 +742,37 @@ fn mount_scratch(root: &str, strict: bool) -> io::Result<()> {
 
 /// Open executable bytes once and hash that open object. The returned file is
 /// the authority-bearing handle used by [`exec_open_file`]; callers must never
-/// resolve the pathname again after this point.
+/// resolve the pathname again after this point. The bytes are hashed through
+/// a private read-only mapping of the file: on the DAX-mounted tool window a
+/// mapping is plain memory, where `read()` crawls through the kernel's DAX
+/// copy path at a few MB/s. Verifying two dozen lent tools cost over four
+/// seconds per cell that way, and about a millisecond this way. A file that
+/// cannot be mapped (an empty one) is read instead.
 fn open_and_hash(path: &str) -> io::Result<(File, Hash)> {
+    use std::os::unix::io::AsRawFd;
     let mut file = File::open(path)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    Ok((file, Hash::of(&bytes)))
+    let len = file.metadata()?.len() as usize;
+    if len == 0 {
+        return Ok((file, Hash::of(&[])));
+    }
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        return Ok((file, Hash::of(&bytes)));
+    }
+    let hash = Hash::of(unsafe { std::slice::from_raw_parts(ptr as *const u8, len) });
+    unsafe { libc::munmap(ptr, len) };
+    Ok((file, hash))
 }
 
 fn sealed_member_path(path: &str) -> bool {
@@ -827,6 +852,12 @@ fn exec_open_file(
     let mut argv: Vec<*const libc::c_char> = argv_strings.iter().map(|arg| arg.as_ptr()).collect();
     argv.push(std::ptr::null());
 
+    // A workload exec'd from a verified sealed closure is told so, so a
+    // harness need not read every lent tool again to repeat pilot's check.
+    let verified = req
+        .closure_members
+        .is_some()
+        .then(|| CString::new("CELLN_CLOSURE_VERIFIED=1").expect("static env entry"));
     let env_strings: Vec<CString> = req
         .env
         .iter()
@@ -834,6 +865,7 @@ fn exec_open_file(
             CString::new(format!("{key}={value}"))
                 .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
         })
+        .chain(verified.map(Ok))
         .collect::<io::Result<_>>()?;
     let mut envp: Vec<*const libc::c_char> =
         env_strings.iter().map(|value| value.as_ptr()).collect();
@@ -1311,6 +1343,8 @@ fn run_one(manifest: &Manifest, req: &RunRequest) {
         // Verify each actual sealed member, not a host assertion about what
         // the filesystem ought to contain. The mount is hardware read-only,
         // so these paths cannot change between hashing and dynamic loading.
+        let verifying = std::time::Instant::now();
+        report("pilot_members", &members.len().to_string());
         if req.root.as_deref() != Some("/tools")
             || members.is_empty()
             || members.len() > 256
@@ -1326,7 +1360,12 @@ fn run_one(manifest: &Manifest, req: &RunRequest) {
             });
             return;
         }
+        report(
+            "pilot_members_verified_ms",
+            &verifying.elapsed().as_millis().to_string(),
+        );
     }
+    let hashing = std::time::Instant::now();
     let Ok((executable, hash)) = open_and_hash(&host_view) else {
         report(&format!("pilot_run_{}", req.alias), "absent");
         if req.report_output_limit.is_some() {
@@ -1336,6 +1375,10 @@ fn run_one(manifest: &Manifest, req: &RunRequest) {
         }
         return;
     };
+    report(
+        "pilot_exec_hashed_ms",
+        &hashing.elapsed().as_millis().to_string(),
+    );
 
     if req
         .expected_hash

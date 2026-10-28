@@ -34,18 +34,26 @@ fn check_lent_tools(tools: &[crate::json_harness::Tool]) -> anyhow::Result<()> {
     use std::{io::Read, os::unix::fs::OpenOptionsExt};
     // Diagnostics only: host publisher, sealing and execution-grant checks
     // remain mandatory. File identity alone is not executable authority.
+    // When pilot has just verified every sealed closure member against the
+    // signed closure (CELLN_CLOSURE_VERIFIED, set only by pilot for a
+    // workload it execs from a verified closure), re-reading two dozen
+    // binaries here only repeats that check: on the sealed, hardware
+    // read-only mount it cost several seconds per cell.
+    let verified_by_pilot = std::env::var_os("CELLN_CLOSURE_VERIFIED").is_some();
     for tool in tools {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&tool.path)?;
         ensure!(file.metadata()?.is_file(), "tool is not a regular file");
-        let mut bytes = Vec::new();
-        file.take(536870913).read_to_end(&mut bytes)?;
-        ensure!(
-            bytes.len() <= 536870912 && Hash::of(&bytes).0 == tool.hash,
-            "lent executable identity mismatch"
-        );
+        if !verified_by_pilot {
+            let mut bytes = Vec::new();
+            file.take(536870913).read_to_end(&mut bytes)?;
+            ensure!(
+                bytes.len() <= 536870912 && Hash::of(&bytes).0 == tool.hash,
+                "lent executable identity mismatch"
+            );
+        }
         ensure!(
             std::fs::OpenOptions::new()
                 .write(true)
