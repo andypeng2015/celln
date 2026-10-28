@@ -1901,6 +1901,30 @@ fn set_long_mode(vcpu: &VcpuFd) -> Result<(), VmmError> {
     vcpu.set_sregs(&sregs).map_err(|e| kvm_err("set_sregs", e))
 }
 
+/// Operator timing trace of the guest's own progress lines: every `CELLN:`
+/// marker the guest prints, stamped with the time since the run began.
+/// Dispatch frames are cut to their kind; nothing else the guest prints is
+/// repeated.
+fn trace_console_byte(line: &mut Vec<u8>, byte: u8, run_began: Instant) {
+    if byte != b'\n' {
+        if line.len() < 160 {
+            line.push(byte);
+        }
+        return;
+    }
+    let line = std::mem::take(line);
+    if let Some(text) = std::str::from_utf8(&line)
+        .ok()
+        .filter(|l| l.starts_with("CELLN:"))
+    {
+        let shown: String = text.chars().take(72).collect();
+        crate::trace::note(
+            "console",
+            &format!("+{:.2}s {shown}", run_began.elapsed().as_secs_f64()),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2642,30 +2666,6 @@ mod tests {
             cell.tool_bytes(&h, tool.len()).unwrap(),
             tool,
             "a full kernel boot must not alter sealed tool bytes"
-        );
-    }
-}
-
-/// Operator timing trace of the guest's own progress lines: every `CELLN:`
-/// marker the guest prints, stamped with the time since the run began.
-/// Dispatch frames are cut to their kind; nothing else the guest prints is
-/// repeated.
-fn trace_console_byte(line: &mut Vec<u8>, byte: u8, run_began: Instant) {
-    if byte != b'\n' {
-        if line.len() < 160 {
-            line.push(byte);
-        }
-        return;
-    }
-    let line = std::mem::take(line);
-    if let Some(text) = std::str::from_utf8(&line)
-        .ok()
-        .filter(|l| l.starts_with("CELLN:"))
-    {
-        let shown: String = text.chars().take(72).collect();
-        crate::trace::note(
-            "console",
-            &format!("+{:.2}s {shown}", run_began.elapsed().as_secs_f64()),
         );
     }
 }
